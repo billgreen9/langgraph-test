@@ -108,3 +108,55 @@ execute → complete ─┬─→ start_step (dynamic 还有步骤)
 ```
 
 核心机制：**条件边按 `node_type` 分流**，**complete 自环实现递归上推**，**`_pause_gate` 在 start_step 与 execute 两处检查暂停标志**实现跨进程暂停/恢复。
+
+
+# skills中三种节点类型的作用
+
+类型在 [skill.json](file:///Users/bill/PycharmProjects/langgraph-test/skills/weather/skill.json) 的 `type` 字段声明，由 [NEXT_BY_TYPE](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L57) 映射决定进入哪个图节点：
+
+```python
+NEXT_BY_TYPE = {"atomic": "execute", "category": "descend", "dynamic": "plan"}
+```
+
+## 1. atomic — 原子 function_call
+**叶子节点，真正干活的**。
+- 进入 [execute_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L503)，调用 `FUNCTIONS[function]` 执行一次函数调用
+- 产生 `output`，是执行树唯一产出实际结果的地方
+- 失败置 FAILED，成功置 COMPLETED
+- 例：`weather.current`（get_weather）、`calc.math`（calc）、`chat`（chat_reply 兜底闲聊）
+
+## 2. category — 容器/目录型
+**组织用，自身不执行任何逻辑，只做下探**。
+- 进入 [descend_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L418)，加载子技能并匹配一个继续向下
+- 不产生 output，最终输出靠 `collect_leaf_outputs` 收集子树所有原子结果
+- 作用：**构建多级目录树**，让技能按领域分组（weather → current/forecast/trip_plan）
+- 可多层嵌套（category 套 category 也行）
+- 例：`weather`（一级 category，order=1）、`translate`、`calc`
+
+## 3. dynamic — 动态规划型
+**运行时按用户意图拆步骤、按顺序编排多个子技能**。
+- 进入 [plan_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L441)，用 LLM（或关键词兜底）把请求拆成有序 `PlanStep` 列表
+- 维护 `plan` + `step_index`，由 [start_step_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L473) 逐个实例化子节点执行
+- 步骤间可传递产物（`input_from="prev_output"`）
+- **支持嵌套**：某个 step 可以是 dynamic，从而在 plan→start_step→plan 之间递归
+- 例：`weather.trip_plan`（出差规划，动态拆成 查天气→查预报→出简报）、`trip_plan.briefing`（嵌套 dynamic，再拆 翻译→总结）
+
+## 三者的协作关系
+
+以"出差去北京三天，给我中文简报"为例：
+
+```
+weather (category)              ← 下探
+└─ trip_plan (dynamic)          ← 规划 3 步
+   ├─ weather_check (atomic)    ← 执行：北京天气
+   ├─ forecast_check (atomic)   ← 执行：3 天预报
+   └─ briefing (dynamic)        ← 嵌套规划 2 步
+      ├─ translate_brief (atomic) ← 执行：翻译
+      └─ chat_brief (atomic)      ← 执行：生成简报
+```
+
+- **category** 负责"组织分层"（静态目录结构）
+- **dynamic** 负责"运行时编排"（按请求动态拆步骤）
+- **atomic** 负责"实际产出"（唯一产生 output 的节点）
+
+三者通过 `_classify` 条件边分流，`complete_node` 自环实现递归上推收束，最终所有 atomic 的 output 在 [finish_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L598) 汇总成最终答案。
