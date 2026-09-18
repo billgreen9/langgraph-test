@@ -1,0 +1,8 @@
+{
+  "name": "未来天气预报",
+  "description": "查询指定城市未来若干天的天气预报",
+  "type": "atomic",
+  "function": "get_weather_forecast",
+  "keywords": ["未来", "明天", "后天", "几天", "预报", "出差", "出行"],
+  "order": 2
+}

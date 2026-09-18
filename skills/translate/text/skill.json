@@ -1,0 +1,8 @@
+{
+  "name": "文本翻译",
+  "description": "把一段文本翻译成目标语言（默认中英互译）",
+  "type": "atomic",
+  "function": "translate_text",
+  "keywords": ["翻译", "译成", "translate"],
+  "order": 1
+}

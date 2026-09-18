@@ -1,0 +1,7 @@
+{
+  "name": "翻译服务",
+  "description": "把文本在中文、英文等语言之间翻译",
+  "type": "category",
+  "keywords": ["翻译", "译成", "英文", "英语", "中文", "translate"],
+  "order": 2
+}

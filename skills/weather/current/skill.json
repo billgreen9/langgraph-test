@@ -1,0 +1,8 @@
+{
+  "name": "实时天气查询",
+  "description": "查询指定城市当前/今天的天气情况",
+  "type": "atomic",
+  "function": "get_weather",
+  "keywords": ["现在", "今天", "当前", "实时", "天气"],
+  "order": 1
+}

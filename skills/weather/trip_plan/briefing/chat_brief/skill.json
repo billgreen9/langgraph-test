@@ -1,0 +1,8 @@
+{
+  "name": "中文出行建议",
+  "description": "基于天气结果用中文总结出行建议简报",
+  "type": "atomic",
+  "function": "chat_reply",
+  "keywords": ["简报", "建议", "总结", "中文"],
+  "order": 2
+}

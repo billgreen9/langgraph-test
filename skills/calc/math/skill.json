@@ -1,0 +1,8 @@
+{
+  "name": "表达式计算器",
+  "description": "求值数学表达式，例如 (1+2)*4",
+  "type": "atomic",
+  "function": "calc",
+  "keywords": ["计算", "表达式", "calc"],
+  "order": 1
+}

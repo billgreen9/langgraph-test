@@ -1,0 +1,8 @@
+{
+  "name": "目的地实时天气",
+  "description": "出行规划步骤：检查目的地当前天气",
+  "type": "atomic",
+  "function": "get_weather",
+  "keywords": ["实时", "现在", "天气"],
+  "order": 1
+}

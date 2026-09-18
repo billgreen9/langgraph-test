@@ -1,0 +1,8 @@
+{
+  "name": "简报翻译",
+  "description": "把天气相关内容翻译成目标语言",
+  "type": "atomic",
+  "function": "translate_text",
+  "keywords": ["翻译", "译成", "英文", "中文"],
+  "order": 1
+}

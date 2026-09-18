@@ -1,0 +1,8 @@
+{
+  "name": "目的地未来预报",
+  "description": "出行规划步骤：检查目的地未来几天预报",
+  "type": "atomic",
+  "function": "get_weather_forecast",
+  "keywords": ["预报", "未来", "几天", "出差", "出行"],
+  "order": 2
+}

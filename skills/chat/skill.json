@@ -1,0 +1,8 @@
+{
+  "name": "闲聊对话（一级原子技能）",
+  "description": "无法归入其他技能域时的兜底对话与文本总结，直接以原子 function_call 执行",
+  "type": "atomic",
+  "function": "chat_reply",
+  "keywords": ["闲聊", "聊天", "笑话", "你好", "您好", "在吗", "总结", "建议", "简报", "chat"],
+  "order": 100
+}
