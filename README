@@ -160,3 +160,77 @@ weather (category)              ← 下探
 - **atomic** 负责"实际产出"（唯一产生 output 的节点）
 
 三者通过 `_classify` 条件边分流，`complete_node` 自环实现递归上推收束，最终所有 atomic 的 output 在 [finish_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L598) 汇总成最终答案。
+
+
+
+# SkillExecutionNode 中 `plan` / `steps` / `step_index` 三者关系与作用
+
+三者只对 **dynamic 节点**有意义（atomic/category 节点的 `plan` 为空、`step_index` 恒为 0）。它们构成 dynamic 节点的"规划—执行—推进"三件套：
+
+## 各自的职责
+
+| 字段 | 类型 | 角色 | 比喻 |
+|------|------|------|------|
+| `plan` | `list[PlanStep]` | **规划蓝图**：LLM 规划出的有序步骤清单（skill_id / objective / arguments / input_from / status） | 菜谱 |
+| `step_index` | `int` | **进度指针**：指向 `plan` 中**下一个要执行**的步骤下标 | 翻到第几页 |
+| `steps` | `list[SkillExecutionNode]` | **执行轨迹**：已实例化的子执行节点（递归树），带真实 output/status | 做出来的菜 |
+
+## 生命周期（一个 dynamic 节点的完整流程）
+
+以 `trip_plan` 规划出 3 步为例：
+
+```
+plan_node 阶段：
+  plan = [weather_check, forecast_check, briefing]
+  step_index = 0
+  steps = []
+  ──────────────────────────────────────────────
+
+第 1 轮：start_step(step_index=0)
+  读 plan[0] → 实例化 weather_check 节点 → append 到 steps
+  steps = [weather_check]   ← len(steps) == step_index + 1
+  complete 后：step_index = 1, plan[0].status = COMPLETED
+
+第 2 轮：start_step(step_index=1)
+  读 plan[1] → 实例化 forecast_check → append
+  steps = [weather_check, forecast_check]
+  complete 后：step_index = 2, plan[1].status = COMPLETED
+
+第 3 轮：start_step(step_index=2)
+  读 plan[2] → 实例化 briefing（本身是 dynamic，递归进入 plan→start_step...）
+  steps = [weather_check, forecast_check, briefing]
+  complete 后：step_index = 3, plan[2].status = COMPLETED
+
+_after_complete 判断：step_index(3) >= len(plan)(3) → 走 complete 收束自身
+```
+
+## 对应关系
+
+核心不变量：**`plan[i]` ↔ `steps[i]`**（下标对齐）
+
+```
+plan:  [step0,   step1,   step2]
+          ↓       ↓       ↓
+steps: [node0,   node1,   node2]
+          ↑
+      已完成(i < step_index) / 进行中(i == step_index) / 未开始(i > step_index)
+```
+
+- `i < step_index`：`plan[i]` 已完成（`status=COMPLETED`），`steps[i]` 有 output
+- `i == step_index`：`plan[i]` 正在执行（`status=RUNNING`），`steps[i]` 正在跑
+- `i > step_index`：`plan[i]` 待执行（`status=PENDING`），`steps[i]` 尚未实例化
+
+## 为什么要同时存 `plan` 和 `steps`
+
+| 只存 `plan` 不行 | 只存 `steps` 不行 |
+|---|---|
+| 暂停/恢复后不知道下一步该跑哪个子技能、用什么参数 | 无法知道总共有几步、步骤是否已全部规划完成 |
+
+`plan` 是**持久化的执行计划**，`steps` 是**运行时的执行产物**。两者配合才能支持：
+1. **暂停/恢复**：恢复时读 `step_index`，从 `plan[step_index]` 继续，已完成步骤的 output 留在 `steps` 里供 `input_from="prev_output"` 回溯
+2. **可观测性**：`collect_dynamic_skills` 收集所有 dynamic 节点，既能看规划（`plan`）又能看执行进度（`step_index`）和产物（`steps`）
+3. **嵌套递归**：`steps[i]` 本身可以是 dynamic 节点，拥有自己的 `plan`/`step_index`/`steps`，形成任意深度的递归执行树
+
+对应代码入口：[plan_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L441) 写 `plan`，[start_step_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L473) 读 `plan[step_index]` 并 append 到 `steps`，[complete_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L573-L577) 推进 `step_index`。
+
+
