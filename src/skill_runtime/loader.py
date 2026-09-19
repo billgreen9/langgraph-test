@@ -57,14 +57,24 @@ class SkillLoader:
             fs_path=str(skill_dir),
             has_children=bool(children),
         )
-        # atomic 技能必须能在函数注册表中找到对应函数
+        # atomic 技能必须能解析到函数：声明 module 的走技能目录本地文件
+        # （只校验文件存在，导入推迟到执行时），否则查全局 FUNCTIONS 注册表
         if manifest.type == "atomic" and manifest.function:
-            from .functions import FUNCTIONS
+            if manifest.module:
+                local = Path(manifest.fs_path) / manifest.module
+                if local.suffix != ".py":
+                    local = local.with_suffix(".py")
+                if not local.is_file():
+                    raise ValueError(
+                        f"技能 {skill_id} 声明的本地函数模块不存在：{local}"
+                    )
+            else:
+                from .functions import FUNCTIONS
 
-            if manifest.function not in FUNCTIONS:
-                raise ValueError(
-                    f"技能 {skill_id} 绑定的函数 '{manifest.function}' 未在 FUNCTIONS 中注册"
-                )
+                if manifest.function not in FUNCTIONS:
+                    raise ValueError(
+                        f"技能 {skill_id} 绑定的函数 '{manifest.function}' 未在 FUNCTIONS 中注册"
+                    )
         with self._lock:
             self._cache[skill_id] = manifest
         return manifest

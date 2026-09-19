@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -41,12 +42,17 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send, interrupt
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
-from pydantic import BaseModel, Field
 
 from ..config import settings
-from .functions import FUNCTIONS
+from .functions import resolve_function
 from .loader import SkillLoader
 from .schema import SkillManifest
+from .tooling import (
+    REACT_FINISH_TOOL,
+    manifest_tool,
+    parse_tool_calls,
+    tool_name_for,
+)
 from .state import (
     AgentState,
     PlanStep,
@@ -72,37 +78,23 @@ NEXT_BY_TYPE = {
 }
 
 
-# ---------- LLM 结构化输出模型 ----------
-class LlmChoice(BaseModel):
-    skill_id: str
-    reason: str = ""
-
-
-class LlmPlanStep(BaseModel):
-    skill_id: str
-    objective: str = ""
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    input_from: str = "user"
-
-
-class LlmPlan(BaseModel):
-    steps: list[LlmPlanStep]
-
-
-class ReactAction(BaseModel):
+# ---------- ReAct 决策内部模型（经 tool_calls 协议解析后填充） ----------
+@dataclass
+class ReactAction:
     """ReAct 单轮规划出的一个原子动作。"""
 
     skill_id: str
     objective: str = ""
-    arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments: dict[str, Any] = field(default_factory=dict)
 
 
-class ReactDecision(BaseModel):
+@dataclass
+class ReactDecision:
     """ReAct 单轮决策：要么给出最终回答，要么给出下一批可并发动作。"""
 
     done: bool = False
     final_answer: str = ""
-    actions: list[ReactAction] = Field(default_factory=list)
+    actions: list[ReactAction] = field(default_factory=list)
 
 
 # 同一原子技能在一个 ReAct 节点内最多允许失败重试的次数
@@ -258,7 +250,7 @@ def _fallback_choice(manifests: list[SkillManifest], text: str) -> SkillManifest
 
 def match_skill(manifests: list[SkillManifest], text: str,
                 rt: Runtime | None = None) -> SkillManifest:
-    """关键词打分；完全无命中时让 LLM 裁决，LLM 不可用则兜底。"""
+    """关键词打分；完全无命中时让 LLM 以 tool_calls 协议裁决，失败则兜底。"""
     if not manifests:
         raise ValueError("没有可匹配的子技能")
     if len(manifests) == 1:
@@ -275,18 +267,20 @@ def match_skill(manifests: list[SkillManifest], text: str,
             f"- {m.skill_id}：{m.name}。{m.description}" for m in manifests
         )
         prompt = (
-            "你是技能路由器。根据用户请求，从候选技能中选择最合适的一个。"
-            "只输出 skill_id，不要执行任务。\n候选技能：\n"
+            "你是技能路由器。根据用户请求，通过调用候选技能对应的工具选择最合适的一个"
+            "（工具名即技能）。不要执行任务，只做选择。\n候选技能：\n"
             f"{listing}\n用户请求：{text}"
         )
         try:
-            choice = rt.llm.with_structured_output(LlmChoice).invoke(
-                [SystemMessage(content=prompt), HumanMessage(content=text)]
-            )
-            selected = next((m for m in manifests if m.skill_id == choice.skill_id), None)
-            if selected is not None:
-                logger.info("LLM 路由选择 %s（%s）", selected.skill_id, choice.reason)
-                return selected
+            resp = rt.llm.bind_tools(
+                [manifest_tool(m, "choose") for m in manifests]
+            ).invoke([SystemMessage(content=prompt), HumanMessage(content=text)])
+            rev = {tool_name_for(m.skill_id): m for m in manifests}
+            for name, _args in parse_tool_calls(resp):
+                selected = rev.get(name)
+                if selected is not None:
+                    logger.info("LLM tool_calls 路由选择 %s", selected.skill_id)
+                    return selected
         except Exception:
             logger.exception("LLM 路由失败，使用关键词/默认兜底")
     return _fallback_choice(manifests, text)
@@ -344,29 +338,37 @@ def build_plan(rt: Runtime, dynamic: SkillManifest, children: list[SkillManifest
         for m in children
     )
     prompt = (
-        "你是动态技能规划器。把用户请求拆成有序步骤，每一步必须且只能引用候选子技能中的一个。"
-        f"最多 {max_steps} 步。为每步给出 skill_id、objective、arguments（参数，可为空对象）、"
-        "input_from（user 表示输入为用户原始请求；prev_output 表示输入为上一步输出，"
+        "你是动态技能规划器。把用户请求拆成有序步骤：每一步通过调用候选子技能对应的"
+        "工具表达（工具名即技能，多次调用按顺序作为步骤顺序）。"
+        f"最多 {max_steps} 步，每步只能引用候选子技能中的一个。"
+        "调用参数除技能自身参数外，可附 objective（步骤目标）与 input_from"
+        "（user 表示输入为用户原始请求；prev_output 表示输入为上一步输出，"
         "翻译/总结类步骤用 prev_output）。\n"
         f"动态技能：{dynamic.name}。{dynamic.description}\n"
         f"规划提示：{hint}\n候选步骤技能：\n{listing}\n用户请求：{text}"
     )
     try:
-        plan = rt.llm.with_structured_output(LlmPlan).invoke(
-            [SystemMessage(content=prompt), HumanMessage(content=text)]
-        )
+        resp = rt.llm.bind_tools(
+            [manifest_tool(m, "plan") for m in children]
+        ).invoke([SystemMessage(content=prompt), HumanMessage(content=text)])
         valid: list[PlanStep] = []
         seen: set[str] = set()
         by_id = {m.skill_id: m for m in children}
-        for s in plan.steps:
-            if s.skill_id not in by_id or s.skill_id in seen:
+        rev = {tool_name_for(m.skill_id): m.skill_id for m in children}
+        for name, args in parse_tool_calls(resp):
+            skill_id = rev.get(name)
+            if skill_id is None or skill_id in seen:
                 continue
-            seen.add(s.skill_id)
+            args = args or {}
+            arguments = {k: v for k, v in args.items()
+                         if k not in ("objective", "input_from")}
+            seen.add(skill_id)
             valid.append(PlanStep(
-                skill_id=s.skill_id,
-                objective=s.objective or by_id[s.skill_id].description,
-                arguments=s.arguments or {},
-                input_from=s.input_from if s.input_from in ("user", "prev_output") else "user",
+                skill_id=skill_id,
+                objective=args.get("objective") or by_id[skill_id].description,
+                arguments=arguments,
+                input_from=args.get("input_from")
+                if args.get("input_from") in ("user", "prev_output") else "user",
             ))
             if len(valid) >= max_steps:
                 break
@@ -388,6 +390,7 @@ def _node_from_manifest(m: SkillManifest) -> SkillExecutionNode:
         level=m.level,
         fs_path=m.fs_path,
         function=m.function,
+        module=m.module,
         status=S.RUNNING,
         started_at=utcnow(),
     )
@@ -569,13 +572,18 @@ async def execute_node(state: AgentState, config: RunnableConfig) -> dict[str, A
 
     await _pause_gate(state, node, config)
 
-    fn = FUNCTIONS.get(node.function or "")
+    fn_error: str | None = None
+    try:
+        fn = resolve_function(node.function, node.module, node.fs_path,
+                              node.skill_id)
+    except Exception as e:
+        fn, fn_error = None, f"本地函数加载失败：{e}"
     text_input = _resolve_input(tree, path, state["user_input"])
 
     if fn is None:
         def fail(n: SkillExecutionNode) -> None:
             n.status = S.FAILED
-            n.error = f"未注册的函数：{node.function}"
+            n.error = fn_error or f"未注册的函数：{node.function}"
             n.finished_at = utcnow()
 
         new_tree, failed = update_node(tree, path, fail)
@@ -650,6 +658,8 @@ def _normalize_actions(
         actions.append({
             "skill_id": manifest.skill_id,
             "function": manifest.function,
+            "module": manifest.module,
+            "fs_path": manifest.fs_path,
             "objective": a.objective or manifest.description,
             "arguments": arguments,
             "parallelizable": manifest.parallelizable and not manifest.self_exclusive,
@@ -673,6 +683,8 @@ def _react_keyword_actions(
     return [{
         "skill_id": chosen.skill_id,
         "function": chosen.function or "",
+        "module": chosen.module,
+        "fs_path": chosen.fs_path,
         "objective": chosen.description,
         "arguments": {},
         "parallelizable": chosen.parallelizable and not chosen.self_exclusive,
@@ -688,7 +700,12 @@ async def _react_llm_decide(
     round_no: int,
     extra_hint: str = "",
 ) -> ReactDecision | None:
-    """调用 LLM 做单轮 ReAct 决策；LLM 不可用/解析失败返回 None。"""
+    """调用 LLM 做单轮 ReAct 决策（tool_calls 协议）；失败/无效返回 None。
+
+    模型要么调用 ``finish`` 工具收束（done=true），要么并发调用候选原子技能
+    对应的工具给出下一批动作（一次响应中的多个 tool_calls 即同批并发动作，
+    顺序即模型给定的顺序）。
+    """
     listing = "\n".join(
         f"- {c.skill_id}：{c.name}。{c.description}（关键词：{','.join(c.keywords)}）"
         for c in children
@@ -696,24 +713,36 @@ async def _react_llm_decide(
     hint = react_manifest.react.objective_hint if react_manifest.react else ""
     prompt = (
         "你是 ReAct 执行器。每轮根据用户请求与往轮观测结果二选一：\n"
-        "1) 信息已足够回答用户：done=true，并在 final_answer 给出中文综合结论；\n"
-        "2) 否则在 actions 中给出【下一批要并发执行】的原子动作。\n"
+        "1) 信息已足够回答用户：调用 finish 工具，在 final_answer 给出中文综合结论；\n"
+        "2) 否则通过调用候选原子技能对应的工具，给出【下一批要并发执行】的动作。\n"
         "同批动作必须互不依赖：它们只能引用用户原始输入；若某动作需要往轮结果，"
         "必须把所需内容显式写进该动作的 arguments（例如 source_text），"
         "绝不能假设同批动作之间存在先后顺序。\n"
-        "每个动作只能引用候选原子技能，不要重复已经成功的动作；没有有用的动作可做时直接 done。\n"
+        "每个动作只能引用候选原子技能，不要重复已经成功的动作；没有有用的动作可做时调用 finish。\n"
         f"ReAct 技能：{react_manifest.name}。{react_manifest.description}\n"
         f"规划提示：{hint}\n候选原子技能：\n{listing}\n"
         f"用户请求：{user_input}\n往轮观测：\n{observations}\n{extra_hint}"
     )
     try:
-        decision = rt.llm.with_structured_output(ReactDecision).invoke(
-            [SystemMessage(content=prompt), HumanMessage(content=user_input)]
-        )
-        logger.info("[react] %s 第 %d 轮 LLM 决策：done=%s, actions=%s",
-                    react_manifest.skill_id, round_no, decision.done,
-                    [a.skill_id for a in decision.actions])
-        return decision
+        resp = await rt.llm.bind_tools(
+            [manifest_tool(c, "react") for c in children] + [REACT_FINISH_TOOL]
+        ).ainvoke([SystemMessage(content=prompt), HumanMessage(content=user_input)])
+        calls = parse_tool_calls(resp)
+        rev = {tool_name_for(c.skill_id): c.skill_id for c in children}
+
+        # finish 优先：无论出现在批次哪个位置都视为收束
+        for name, args in calls:
+            if name == REACT_FINISH_TOOL["function"]["name"]:
+                logger.info("[react] %s 第 %d 轮 LLM 调用 finish",
+                            react_manifest.skill_id, round_no)
+                return ReactDecision(done=True,
+                                     final_answer=str(args.get("final_answer") or ""))
+        actions = [ReactAction(skill_id=rev[name], arguments=args)
+                   for name, args in calls if name in rev]
+        logger.info("[react] %s 第 %d 轮 LLM 决策：actions=%s",
+                    react_manifest.skill_id, round_no,
+                    [a.skill_id for a in actions])
+        return ReactDecision(done=False, actions=actions)
     except Exception:
         logger.exception("[react] %s 第 %d 轮 LLM 决策失败",
                          react_manifest.skill_id, round_no)
@@ -885,9 +914,15 @@ async def parallel_execute_node(
             "error": error,
         }
 
-    fn = FUNCTIONS.get(payload["function"])
+    fn_error: str | None = None
+    try:
+        fn = resolve_function(payload["function"], payload.get("module"),
+                              payload.get("fs_path"), payload["skill_id"])
+    except Exception as e:
+        fn, fn_error = None, f"本地函数加载失败：{e}"
     if fn is None:
-        result = make_result(S.FAILED, None, f"未注册的函数：{payload['function']}")
+        result = make_result(S.FAILED, None,
+                             fn_error or f"未注册的函数：{payload['function']}")
     else:
         try:
             value = await asyncio.to_thread(
@@ -1067,6 +1102,8 @@ def _after_react_think(state: AgentState):
             "task_id": state["task_id"],
             "skill_id": action["skill_id"],
             "function": action["function"],
+            "module": action.get("module"),
+            "fs_path": action.get("fs_path"),
             "objective": action["objective"],
             "arguments": action["arguments"],
             "text_input": state["user_input"],

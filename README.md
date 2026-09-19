@@ -84,7 +84,7 @@ START → enter_task ─┬─ atomic ───▶ execute ───────
 
 ### ReAct 并发
 
-- `react_think` 输出结构化 `ReactDecision`（`done / final_answer / actions[]`），`_after_react_think` 用 LangGraph `Send` 把同批动作扇出。
+- `react_think` 以 tool_calls 协议决策：调用 `finish` 工具表示收束，否则并发调用候选原子技能对应的工具作为本批动作；`_after_react_think` 用 LangGraph `Send` 把同批动作扇出。
 - `parallel_execute` 用 `asyncio.to_thread` 跑同步函数；各分支只写 `branch_results`（`operator.add` reducer），`react_join` 屏障合入树。
 - 护栏：`max_rounds` 轮次上限、动作校验与指纹去重、失败重试上限；`parallelizable=false` 或 `self_exclusive=true` 的原子技能会被机械拆为单独一波。
 
@@ -114,12 +114,19 @@ skills/weather/trip_react/r_current/skill.json  →  skill_id = weather.trip_rea
 }
 ```
 
-### 函数注册（不使用 OpenAI tools 协议）
+### 函数注册与 tool_calls 协议
 
-LLM 只输出 Pydantic 结构化 JSON（skill_id + arguments），执行层按名查表调用 Python 函数：
+所有 LLM 决策（意图选择、技能选择、dynamic 规划、react 动作决策）统一使用 **OpenAI 原生 function calling（tools / tool_calls）协议**，适配层见 [tooling.py](src/skill_runtime/tooling.py)：
+
+- 工具名由 `skill_id` 映射（`.` → `__`，满足 OpenAI 工具名规则），解析时映射回 skill_id；
+- atomic 技能的工具参数 schema **直接从注册函数签名推导**（排除注入参数 `text` 与 `**kwargs`），provider 端即校验参数；
+- 选择类决策（意图/技能匹配）绑定轻量 reason 工具；dynamic 规划按调用顺序映射为步骤（附加 `objective` / `input_from` 元参数）；react 每轮并发调用候选原子技能工具作为动作批次，调用 `finish` 工具表示收束；
+- LLM 无响应/调用无效时按原有关键词兜底降级。
+
+执行层按名查表调用 Python 函数：
 
 ```python
-FUNCTIONS: dict[str, dict] = {}
+FUNCTIONS: dict[str, Callable] = {}
 
 @register_function("calc")
 def calc(text: str = "", expr: str | None = None, **_) -> str:
@@ -129,6 +136,22 @@ def calc(text: str = "", expr: str | None = None, **_) -> str:
 - atomic 技能在 `skill.json` 的 `"function"` 字段绑定函数名。
 - 所有函数统一签名：`fn(text: str, **arguments) -> str`，`text` 为用户原话或上一步产物。
 - 已注册函数：`get_weather`、`get_weather_forecast`、`translate_text`、`calc`、`chat_reply`。
+
+### 本地函数模块（skill.json 的 module 字段）
+
+atomic 技能也可以把函数放在**自己技能目录内**，实现真正的目录级自治：
+
+```
+skills/calc/power/
+├── skill.json       { "type": "atomic", "module": "functions", "function": "power", ... }
+└── functions.py     def power(text: str = "", base=None, exponent=None, **_) -> str: ...
+```
+
+解析规则（[functions.py](src/skill_runtime/functions.py) 的 `resolve_function`）：
+
+- 声明了 `module` → 执行到该技能时才用 `importlib` 从技能目录**惰性导入**（渐进式加载与 manifest 同步），并以 `skill_id` 派生唯一模块别名（如 `skills.calc_power.functions`）注册进 `sys.modules`——**不同目录的同名函数互不冲突**；
+- 未声明 `module` → 查全局 `FUNCTIONS` 注册表（内置/共享函数，启动时全量注册）；
+- loader 加载 manifest 时只校验本地模块文件存在，导入推迟到执行时；失败会转为节点 FAILED（`本地函数加载失败`），不影响其他任务。
 
 ### 渐进式加载
 

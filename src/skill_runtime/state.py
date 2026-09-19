@@ -57,6 +57,7 @@ class SkillExecutionNode(BaseModel):
     level: int
     fs_path: str = ""
     function: str | None = None
+    module: str | None = None  # 声明时 function 从技能目录本地文件惰性导入
     objective: str = ""  # 若本节点由动态规划步骤实例化，记录该步骤目标
     arguments: dict[str, Any] = Field(default_factory=dict)
     input_from: str = "user"

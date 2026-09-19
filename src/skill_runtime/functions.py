@@ -12,9 +12,15 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import logging
 import operator
 import re
+import sys
 from collections.abc import Callable
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ---------- 注册表 ----------
 FunctionRegistry = dict[str, Callable[..., str]]
@@ -28,6 +34,61 @@ def register_function(name: str) -> Callable[[Callable[..., str]], Callable[...,
         return fn
 
     return deco
+
+
+# ---------- 技能目录本地函数（渐进式加载） ----------
+# 缓存键：skill_id 命名空间 + 模块 + 符号，进程内只导入一次
+_LOCAL_CACHE: dict[tuple[str, str, str], Callable[..., str]] = {}
+
+
+def load_skill_function(base_dir: str | Path, module: str, symbol: str,
+                        namespace: str) -> Callable[..., str]:
+    """从技能目录内的 Python 文件惰性加载函数。
+
+    - ``base_dir``：技能目录（manifest.fs_path）；``module`` 是相对它的
+      Python 文件（``"functions"`` 或 ``"functions.py"``）；
+    - 以 ``namespace``（skill_id）派生唯一模块别名注册进 sys.modules，
+      不同技能目录中的同名函数互不冲突（命名空间隔离）；
+    - 进程内缓存，同一技能函数只导入一次。
+    """
+    key = (namespace, module, symbol)
+    if key in _LOCAL_CACHE:
+        return _LOCAL_CACHE[key]
+
+    p = Path(base_dir) / module
+    if p.suffix != ".py":
+        p = p.with_suffix(".py")
+    if not p.is_file():
+        raise FileNotFoundError(f"技能本地模块不存在：{p}")
+
+    alias = f"skills.{namespace.replace('.', '_')}.{p.stem}"
+    spec = importlib.util.spec_from_file_location(alias, p)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法构造模块 spec：{p}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = mod
+    spec.loader.exec_module(mod)
+
+    fn = getattr(mod, symbol, None)
+    if not callable(fn):
+        raise AttributeError(f"模块 {p} 中未找到可调用函数：{symbol}")
+    _LOCAL_CACHE[key] = fn
+    logger.info("已加载技能本地函数 %s:%s（模块别名 %s）", namespace, symbol, alias)
+    return fn
+
+
+def resolve_function(name: str | None, module: str | None = None,
+                     base_dir: str | None = None,
+                     namespace: str = "") -> Callable[..., str] | None:
+    """统一解析技能绑定的可调用对象。
+
+    - 未声明 ``module``：查全局 FUNCTIONS 注册表（内置/共享函数）；
+    - 声明了 ``module``：从技能目录本地文件按 skill_id 命名空间惰性导入，
+      加载失败抛异常（文件不存在 / 符号缺失）。
+    """
+    if not module:
+        return FUNCTIONS.get(name or "")
+    return load_skill_function(base_dir or ".", module, name or "", namespace)
 
 
 # ---------- 天气 ----------

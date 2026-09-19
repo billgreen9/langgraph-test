@@ -38,6 +38,9 @@ class SkillManifest(BaseModel):
     type: SkillType
     keywords: list[str] = Field(default_factory=list)
     function: str | None = None  # atomic 技能绑定的函数名
+    # atomic 技能可选：相对技能目录的本地函数文件（如 "functions" 或 "functions.py"）。
+    # 声明后 function 从该文件按 skill_id 命名空间惰性导入；未声明则查全局 FUNCTIONS 注册表
+    module: str | None = None
     planner: PlannerConfig | None = None
     react: ReactConfig | None = None
     # atomic 并发声明：parallelizable=False 或 self_exclusive=True 的技能

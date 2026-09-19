@@ -28,11 +28,11 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel
 
 from ..db import ChatTask, db
 from .graph import Runtime, _runtime  # 复用同一运行时（LLM/连接池/加载器）
 from .intent_loader import IntentLoader, IntentSpec
+from .tooling import parse_tool_calls, tool_name_for
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +57,20 @@ class RouterState(TypedDict, total=False):
     task_ids: list[str]
 
 
-class LlmIntentChoice(BaseModel):
-    intent_id: str
-    reason: str = ""
+def _intent_tool(spec: IntentSpec) -> dict[str, Any]:
+    """意图 → OpenAI 工具定义（工具名即意图，参数只带 reason）。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": tool_name_for(spec.intent_id),
+            "description": f"[{spec.intent_id}] {spec.name}。{spec.body}",
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string"}},
+                "required": [],
+            },
+        },
+    }
 
 
 # ---------- 意图匹配 ----------
@@ -84,7 +95,7 @@ def _fallback_intent(intents: list[IntentSpec], text: str) -> IntentSpec:
 def match_intent(
     intents: list[IntentSpec], text: str, rt: Runtime | None = None
 ) -> IntentSpec:
-    """关键词命中优先；无命中时让 LLM 基于意图说明裁决；失败则兜底。"""
+    """关键词命中优先；无命中时让 LLM 以 tool_calls 协议裁决；失败则兜底。"""
     if not intents:
         raise ValueError("skills/intents 下没有任何意图技能")
     if len(intents) == 1:
@@ -96,20 +107,20 @@ def match_intent(
             f"- {s.intent_id}：{s.name}。{s.body}" for s in intents
         )
         prompt = (
-            "你是意图路由器。根据用户消息，从候选意图中选择唯一最合适的一个，"
-            "只输出 intent_id，不要执行任务。\n候选意图：\n"
+            "你是意图路由器。根据用户消息，通过调用候选意图对应的工具选择唯一最合适的"
+            "一个（工具名即意图），不要执行任务。\n候选意图：\n"
             f"{listing}\n用户消息：{text}"
         )
         try:
-            choice = rt.llm.with_structured_output(LlmIntentChoice).invoke(
-                [SystemMessage(content=prompt), HumanMessage(content=text)]
-            )
-            selected = next(
-                (s for s in intents if s.intent_id == choice.intent_id), None
-            )
-            if selected is not None:
-                logger.info("LLM 意图选择 %s（%s）", selected.intent_id, choice.reason)
-                return selected
+            resp = rt.llm.bind_tools(
+                [_intent_tool(s) for s in intents]
+            ).invoke([SystemMessage(content=prompt), HumanMessage(content=text)])
+            rev = {tool_name_for(s.intent_id): s for s in intents}
+            for name, _args in parse_tool_calls(resp):
+                selected = rev.get(name)
+                if selected is not None:
+                    logger.info("LLM tool_calls 意图选择 %s", selected.intent_id)
+                    return selected
         except Exception:
             logger.exception("LLM 意图路由失败，使用关键词/默认兜底")
     return _fallback_intent(intents, text)
