@@ -1138,13 +1138,38 @@ def build_graph(rt: Runtime):
     return g.compile(checkpointer=rt.saver)
 
 
-def _config(rt: Runtime, thread_id: str) -> RunnableConfig:
-    return {"configurable": {"thread_id": thread_id, "runtime": rt}}
+def run_config(
+    rt: Runtime,
+    thread_id: str,
+    *,
+    run_name: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> RunnableConfig:
+    """构造图调用配置。
+
+    run_name/tags/metadata 会透传到 LangSmith 等追踪后端，便于排查问题：
+    - run_name : 本次运行的显示名，如 task_task-6beb3138_天气查询
+    - tags     : 按图类型 / 技能 / 会话筛选（task / skill:xxx / session:xxx）
+    - metadata : 业务键值（task_id、session_id、entry_skill_id 等）
+    """
+    cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "runtime": rt}}
+    if run_name:
+        cfg["run_name"] = run_name
+    if tags:
+        cfg["tags"] = tags
+    if metadata:
+        cfg["metadata"] = metadata
+    return cfg
 
 
 # ---------- 对外：启动 / 恢复 / 查看记忆 ----------
 async def start_task(rt: Runtime, app, task_id: str) -> dict[str, Any]:
     """启动一个任务的 TaskGraph（thread_id=task_id）。"""
+    task = await rt.get_task(task_id) or {}
+    entry = task.get("entry_skill_id") or "unknown"
+    title = task.get("title") or entry
+    session = task.get("session_id") or "unknown"
     initial: AgentState = {
         "task_id": task_id,
         "status": S.RUNNING,
@@ -1153,27 +1178,57 @@ async def start_task(rt: Runtime, app, task_id: str) -> dict[str, Any]:
         "cursor": [],
     }
     try:
-        return await app.ainvoke(initial, _config(rt, task_id))
+        return await app.ainvoke(
+            initial,
+            run_config(
+                rt,
+                task_id,
+                run_name=f"task_{task_id}_{title}",
+                tags=["task", f"skill:{entry}", f"session:{session}"],
+                metadata={
+                    "task_id": task_id,
+                    "session_id": session,
+                    "entry_skill_id": entry,
+                    "title": title,
+                    "phase": "start",
+                },
+            ),
+        )
     except GraphInterrupt:
         logger.info("task_id=%s 已在步骤边界暂停", task_id)
-        snap = await app.aget_state(_config(rt, task_id))
+        snap = await app.aget_state(run_config(rt, task_id))
         return snap.values
 
 
 async def resume_task(rt: Runtime, app, task_id: str) -> dict[str, Any]:
     """凭 task_id 从 checkpoint 恢复被暂停的 TaskGraph。"""
     await rt.mark_running(task_id)
+    task = await rt.get_task(task_id) or {}
+    entry = task.get("entry_skill_id") or "unknown"
+    session = task.get("session_id") or "unknown"
     try:
         return await app.ainvoke(
-            Command(resume={"resume": True}), _config(rt, task_id)
+            Command(resume={"resume": True}),
+            run_config(
+                rt,
+                task_id,
+                run_name=f"resume_{task_id}",
+                tags=["task", "resume", f"skill:{entry}", f"session:{session}"],
+                metadata={
+                    "task_id": task_id,
+                    "session_id": session,
+                    "entry_skill_id": entry,
+                    "phase": "resume",
+                },
+            ),
         )
     except GraphInterrupt:
         logger.info("task_id=%s 仍处于暂停（又收到新的暂停请求）", task_id)
-        snap = await app.aget_state(_config(rt, task_id))
+        snap = await app.aget_state(run_config(rt, task_id))
         return snap.values
 
 
 async def get_memory(rt: Runtime, app, task_id: str) -> dict[str, Any] | None:
     """读取某任务在 LangGraph（PostgreSQL checkpoint）中持久化的记忆快照。"""
-    snap = await app.aget_state(_config(rt, task_id))
+    snap = await app.aget_state(run_config(rt, task_id))
     return snap.values if snap else None

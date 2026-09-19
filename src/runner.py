@@ -22,6 +22,7 @@ from .skill_runtime.graph import (
     build_graph,
     get_memory,
     resume_task,
+    run_config,
     start_task,
 )
 from .skill_runtime.loader import SkillLoader
@@ -53,7 +54,8 @@ async def _synthesize(
     )
     try:
         resp = await rt.llm.ainvoke(
-            [SystemMessage(content=prompt), HumanMessage(content=user_content)]
+            [SystemMessage(content=prompt), HumanMessage(content=user_content)],
+            config={"run_name": "synthesize_final_answer", "tags": ["aggregate"]},
         )
         text = resp.content if isinstance(resp, AIMessage) else str(resp)
         if text and text.strip():
@@ -73,7 +75,13 @@ async def process_message(
         router = build_router_graph(rt)
         await router.ainvoke(
             {"chat_id": chat_id},
-            {"configurable": {"thread_id": chat_id, "runtime": rt}},
+            run_config(
+                rt,
+                chat_id,
+                run_name=f"router_{chat_id}",
+                tags=["router"],
+                metadata={"chat_id": chat_id},
+            ),
         )
 
         # 2. 执行：与该消息关联的 pending 任务，各自独立 TaskGraph
