@@ -2,9 +2,12 @@
 
 提供：
 - 同步连接池（后台扫描线程 / CLI 使用）
-- 业务表建表语句：chat_records（用户聊天记录）、skill_registry（技能注册表）
-- 聊天记录与技能注册表的 CRUD
-- 运行控制（按 chat_id 启动/暂停/恢复）
+- 业务表：
+  * chat_record：纯聊天消息时间线（user / assistant）
+  * chat_task：路由拆出的执行任务（执行态/暂停/产物的唯一载体）
+  * chat_task_message：任务与消息的多对多关联
+  * skill_registry：技能注册表（后台扫描线程维护）
+- 上述各表的 CRUD 与运行控制（按 task_id 启动/暂停/恢复）
 """
 
 from __future__ import annotations
@@ -26,12 +29,31 @@ def _utcnow() -> datetime:
 
 # ---------- 数据模型 ----------
 class ChatRecord(BaseModel):
+    """一条聊天消息（纯记录，不含任何执行态）。"""
+
     chat_id: str
+    session_id: str
     user_id: str | None = None
+    role: str = "user"  # user / assistant
     content: str
-    status: str = "pending"  # pending/running/paused/completed/failed
+    created_at: datetime | None = None
+
+
+class ChatTask(BaseModel):
+    """由路由从消息拆出的执行任务。"""
+
+    task_id: str
+    session_id: str
+    title: str = ""
+    content: str = ""
+    entry_skill_id: str = ""
+    arguments: dict[str, Any] = {}
+    # collecting(信息不全,等后续消息) / pending(就绪待执行)
+    # / running / paused / completed / failed
+    status: str = "pending"
     pause_requested: bool = False
-    response: str | None = None
+    output: str | None = None
+    error: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -40,7 +62,7 @@ class SkillRow(BaseModel):
     skill_id: str
     name: str
     description: str
-    skill_type: str  # category / atomic / dynamic
+    skill_type: str  # category / atomic / dynamic / react
     level: int
     parent_id: str | None
     fs_path: str
@@ -52,17 +74,44 @@ class SkillRow(BaseModel):
 
 # ---------- 建表 DDL ----------
 _SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS chat_records (
+CREATE TABLE IF NOT EXISTS chat_record (
+    id          BIGSERIAL PRIMARY KEY,
+    chat_id     VARCHAR(64) UNIQUE NOT NULL,
+    session_id  VARCHAR(64) NOT NULL,
+    user_id     VARCHAR(64),
+    role        VARCHAR(16) NOT NULL DEFAULT 'user',
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_record_session ON chat_record(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS chat_task (
     id              BIGSERIAL PRIMARY KEY,
-    chat_id         VARCHAR(64) UNIQUE NOT NULL,
-    user_id         VARCHAR(64),
-    content         TEXT NOT NULL,
-    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+    task_id         VARCHAR(64) UNIQUE NOT NULL,
+    session_id      VARCHAR(64) NOT NULL,
+    title           VARCHAR(255) NOT NULL DEFAULT '',
+    content         TEXT NOT NULL DEFAULT '',
+    entry_skill_id  VARCHAR(255) NOT NULL,
+    arguments       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status          VARCHAR(20) NOT NULL DEFAULT 'collecting',
     pause_requested BOOLEAN NOT NULL DEFAULT FALSE,
-    response        TEXT,
+    output          TEXT,
+    error           TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS idx_chat_task_session ON chat_task(session_id);
+CREATE INDEX IF NOT EXISTS idx_chat_task_status  ON chat_task(status);
+
+CREATE TABLE IF NOT EXISTS chat_task_message (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    VARCHAR(64) NOT NULL REFERENCES chat_task(task_id),
+    chat_id    VARCHAR(64) NOT NULL REFERENCES chat_record(chat_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, chat_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ctm_chat ON chat_task_message(chat_id);
+CREATE INDEX IF NOT EXISTS idx_ctm_task ON chat_task_message(task_id);
 
 CREATE TABLE IF NOT EXISTS skill_registry (
     skill_id     VARCHAR(255) PRIMARY KEY,
@@ -81,6 +130,14 @@ CREATE TABLE IF NOT EXISTS skill_registry (
 );
 CREATE INDEX IF NOT EXISTS idx_skill_registry_level ON skill_registry(level);
 CREATE INDEX IF NOT EXISTS idx_skill_registry_parent ON skill_registry(parent_id);
+"""
+
+# 旧版单体 chat_records 表（含 status/response/pause_requested 列）的特征列
+_LEGACY_CHECK_SQL = """
+SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'chat_records' AND column_name = 'status'
+) AS is_legacy
 """
 
 
@@ -126,94 +183,204 @@ class Database:
     # ---------- schema ----------
     def init_schema(self) -> None:
         with self.pool.connection() as conn:
+            # 旧版单体表无迁移价值（均为测试数据），检测到直接丢弃重建
+            legacy = conn.execute(_LEGACY_CHECK_SQL).fetchone()
+            if legacy and legacy["is_legacy"]:
+                conn.execute("DROP TABLE IF EXISTS chat_records CASCADE")
             conn.execute(_SCHEMA_SQL)
             conn.commit()
 
-    # ---------- chat_records ----------
-    def upsert_chat(self, chat: ChatRecord) -> None:
-        sql = """
-            INSERT INTO chat_records (chat_id, user_id, content, status, pause_requested, response, updated_at)
-            VALUES (%(chat_id)s, %(user_id)s, %(content)s, %(status)s, %(pause_requested)s, %(response)s, %(ts)s)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                user_id         = EXCLUDED.user_id,
-                content         = EXCLUDED.content,
-                status          = EXCLUDED.status,
-                pause_requested = EXCLUDED.pause_requested,
-                response        = EXCLUDED.response,
-                updated_at      = EXCLUDED.updated_at
-        """
+    # ---------- chat_record ----------
+    def insert_message(self, chat: ChatRecord) -> ChatRecord:
         with self.pool.connection() as conn:
-            conn.execute(
-                sql,
+            row = conn.execute(
+                """
+                INSERT INTO chat_record (chat_id, session_id, user_id, role, content)
+                VALUES (%(chat_id)s, %(session_id)s, %(user_id)s, %(role)s, %(content)s)
+                RETURNING created_at
+                """,
                 {
                     "chat_id": chat.chat_id,
+                    "session_id": chat.session_id,
                     "user_id": chat.user_id,
+                    "role": chat.role,
                     "content": chat.content,
-                    "status": chat.status,
-                    "pause_requested": chat.pause_requested,
-                    "response": chat.response,
-                    "ts": _utcnow(),
                 },
-            )
+            ).fetchone()
             conn.commit()
+        chat.created_at = row["created_at"]
+        return chat
 
-    def get_chat(self, chat_id: str) -> ChatRecord | None:
+    def get_message(self, chat_id: str) -> ChatRecord | None:
         with self.pool.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM chat_records WHERE chat_id = %s", (chat_id,)
+                "SELECT * FROM chat_record WHERE chat_id = %s", (chat_id,)
             ).fetchone()
-        return ChatRecord(**dict(row)) if row else None
+        return _row_to_message(row) if row else None
 
-    def list_chats(self, limit: int = 50) -> list[ChatRecord]:
+    def list_messages(self, session_id: str, limit: int = 100) -> list[ChatRecord]:
         with self.pool.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM chat_records ORDER BY id DESC LIMIT %s", (limit,)
+                "SELECT * FROM chat_record WHERE session_id = %s "
+                "ORDER BY id ASC LIMIT %s",
+                (session_id, limit),
             ).fetchall()
-        return [ChatRecord(**dict(r)) for r in rows]
+        return [_row_to_message(r) for r in rows]
 
-    def get_pending_chat(self) -> ChatRecord | None:
-        """读取一条待处理（pending）的聊天记录。"""
+    def list_recent_messages(self, limit: int = 50) -> list[ChatRecord]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM chat_record ORDER BY id DESC LIMIT %s", (limit,)
+            ).fetchall()
+        return [_row_to_message(r) for r in rows]
+
+    # ---------- chat_task ----------
+    def insert_task(self, task: ChatTask) -> ChatTask:
+        import json
+
         with self.pool.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM chat_records WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+                """
+                INSERT INTO chat_task
+                    (task_id, session_id, title, content, entry_skill_id, arguments,
+                     status, pause_requested)
+                VALUES
+                    (%(task_id)s, %(session_id)s, %(title)s, %(content)s,
+                     %(entry_skill_id)s, %(arguments)s, %(status)s, FALSE)
+                RETURNING created_at, updated_at
+                """,
+                {
+                    "task_id": task.task_id,
+                    "session_id": task.session_id,
+                    "title": task.title,
+                    "content": task.content,
+                    "entry_skill_id": task.entry_skill_id,
+                    "arguments": json.dumps(task.arguments, ensure_ascii=False),
+                    "status": task.status,
+                },
             ).fetchone()
-        return ChatRecord(**dict(row)) if row else None
+            conn.commit()
+        task.created_at = row["created_at"]
+        task.updated_at = row["updated_at"]
+        return task
 
-    def update_chat_status(
+    def get_task(self, task_id: str) -> ChatTask | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_task WHERE task_id = %s", (task_id,)
+            ).fetchone()
+        return _row_to_task(row) if row else None
+
+    def list_tasks(
+        self, session_id: str | None = None, status: str | None = None,
+        limit: int = 100,
+    ) -> list[ChatTask]:
+        sql = "SELECT * FROM chat_task WHERE 1=1"
+        params: list[Any] = []
+        if session_id is not None:
+            sql += " AND session_id = %s"
+            params.append(session_id)
+        if status is not None:
+            sql += " AND status = %s"
+            params.append(status)
+        sql += " ORDER BY id ASC LIMIT %s"
+        params.append(limit)
+        with self.pool.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_row_to_task(r) for r in rows]
+
+    def list_tasks_for_message(self, chat_id: str) -> list[ChatTask]:
+        """与某条消息关联的全部任务（多对多）。"""
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.* FROM chat_task t
+                JOIN chat_task_message m ON m.task_id = t.task_id
+                WHERE m.chat_id = %s
+                ORDER BY t.id ASC
+                """,
+                (chat_id,),
+            ).fetchall()
+        return [_row_to_task(r) for r in rows]
+
+    def update_task(
         self,
-        chat_id: str,
-        status: str,
-        response: str | None = None,
+        task_id: str,
+        *,
+        status: str | None = None,
+        output: str | None = None,
+        error: str | None = None,
+        content: str | None = None,
+        title: str | None = None,
         pause_requested: bool | None = None,
+        arguments: dict[str, Any] | None = None,
     ) -> None:
-        sets = ["status = %s", "updated_at = %s"]
-        params: list[Any] = [status, _utcnow()]
-        if response is not None:
-            sets.append("response = %s")
-            params.append(response)
+        import json
+
+        sets = ["updated_at = %s"]
+        params: list[Any] = [_utcnow()]
+        if status is not None:
+            sets.append("status = %s")
+            params.append(status)
+        if output is not None:
+            sets.append("output = %s")
+            params.append(output)
+        if error is not None:
+            sets.append("error = %s")
+            params.append(error)
+        if content is not None:
+            sets.append("content = %s")
+            params.append(content)
+        if title is not None:
+            sets.append("title = %s")
+            params.append(title)
         if pause_requested is not None:
             sets.append("pause_requested = %s")
             params.append(pause_requested)
-        params.append(chat_id)
+        if arguments is not None:
+            sets.append("arguments = %s")
+            params.append(json.dumps(arguments, ensure_ascii=False))
+        params.append(task_id)
         with self.pool.connection() as conn:
             conn.execute(
-                f"UPDATE chat_records SET {', '.join(sets)} WHERE chat_id = %s", params
+                f"UPDATE chat_task SET {', '.join(sets)} WHERE task_id = %s", params
             )
             conn.commit()
 
-    def request_pause(self, chat_id: str) -> None:
-        """请求暂停：置位 pause_requested，运行中的 graph 会在步骤边界挂起。"""
-        self.update_chat_status(chat_id, "paused", pause_requested=True)
+    def request_task_pause(self, task_id: str) -> None:
+        """请求暂停：置位 pause_requested，task graph 在下一个步骤边界挂起。"""
+        self.update_task(task_id, status="paused", pause_requested=True)
 
-    def request_resume(self, chat_id: str) -> None:
-        """解除暂停标记，恢复执行时由 graph 重新置为 running。"""
+    def request_task_resume(self, task_id: str) -> None:
+        """解除暂停标记，恢复执行时由 task graph 重新置为 running。"""
         with self.pool.connection() as conn:
             conn.execute(
-                "UPDATE chat_records SET pause_requested = FALSE, status = 'running', updated_at = %s "
-                "WHERE chat_id = %s",
-                (_utcnow(), chat_id),
+                "UPDATE chat_task SET pause_requested = FALSE, status = 'running', "
+                "updated_at = %s WHERE task_id = %s",
+                (_utcnow(), task_id),
             )
             conn.commit()
+
+    # ---------- chat_task_message ----------
+    def link_task_message(self, task_id: str, chat_id: str) -> None:
+        with self.pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_task_message (task_id, chat_id)
+                VALUES (%s, %s)
+                ON CONFLICT (task_id, chat_id) DO NOTHING
+                """,
+                (task_id, chat_id),
+            )
+            conn.commit()
+
+    def list_message_ids_for_task(self, task_id: str) -> list[str]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT chat_id FROM chat_task_message WHERE task_id = %s ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        return [r["chat_id"] for r in rows]
 
     # ---------- skill_registry ----------
     def upsert_skill(self, skill: SkillRow) -> None:
@@ -288,6 +455,39 @@ class Database:
                 (list(valid_ids),),
             )
             conn.commit()
+
+
+def _row_to_message(row: dict[str, Any]) -> ChatRecord:
+    return ChatRecord(
+        chat_id=row["chat_id"],
+        session_id=row["session_id"],
+        user_id=row.get("user_id"),
+        role=row["role"],
+        content=row["content"],
+        created_at=row.get("created_at"),
+    )
+
+
+def _row_to_task(row: dict[str, Any]) -> ChatTask:
+    import json
+
+    arguments = row.get("arguments") or {}
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
+    return ChatTask(
+        task_id=row["task_id"],
+        session_id=row["session_id"],
+        title=row.get("title") or "",
+        content=row.get("content") or "",
+        entry_skill_id=row["entry_skill_id"],
+        arguments=arguments,
+        status=row["status"],
+        pause_requested=row["pause_requested"],
+        output=row.get("output"),
+        error=row.get("error"),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
 
 
 def _row_to_skill(row: dict[str, Any]) -> SkillRow:

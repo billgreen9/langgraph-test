@@ -1,0 +1,8 @@
+{
+  "name": "未来预报（ReAct）",
+  "description": "ReAct 动作：查询目的地未来几天预报，可在 arguments 中传 city、days",
+  "type": "atomic",
+  "function": "get_weather_forecast",
+  "keywords": ["预报", "未来", "几天"],
+  "order": 2
+}

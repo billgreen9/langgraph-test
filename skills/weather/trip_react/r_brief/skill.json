@@ -1,0 +1,8 @@
+{
+  "name": "出行简报（ReAct）",
+  "description": "ReAct 动作：基于已有天气信息生成出行建议简报",
+  "type": "atomic",
+  "function": "chat_reply",
+  "keywords": ["简报", "建议", "总结"],
+  "order": 4
+}

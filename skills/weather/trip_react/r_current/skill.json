@@ -1,0 +1,8 @@
+{
+  "name": "实时天气（ReAct）",
+  "description": "ReAct 动作：查询目的地当前天气，可在 arguments 中传 city",
+  "type": "atomic",
+  "function": "get_weather",
+  "keywords": ["实时", "现在", "天气"],
+  "order": 1
+}

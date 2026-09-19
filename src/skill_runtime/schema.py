@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-SkillType = Literal["category", "atomic", "dynamic"]
+SkillType = Literal["category", "atomic", "dynamic", "react"]
 
 
 class PlannerConfig(BaseModel):
@@ -16,12 +16,20 @@ class PlannerConfig(BaseModel):
     objective_hint: str = ""
 
 
+class ReactConfig(BaseModel):
+    """ReAct 技能的增量规划配置（每轮只规划一批可并发的原子动作）。"""
+
+    max_rounds: int = Field(default=5, ge=1, le=20)
+    objective_hint: str = ""
+
+
 class SkillManifest(BaseModel):
     """一个技能目录的完整描述。
 
     - category：容器型技能，路由按渐进式原则继续向下匹配子技能
     - atomic：原子技能，直接映射到 functions 注册表中的一次 function_call
     - dynamic：动态规划技能，运行时由规划器拆成多个步骤逐步执行
+    - react：ReAct 技能，每轮由 LLM 基于已观测结果规划下一批可并发原子动作
     """
 
     skill_id: str
@@ -31,6 +39,11 @@ class SkillManifest(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     function: str | None = None  # atomic 技能绑定的函数名
     planner: PlannerConfig | None = None
+    react: ReactConfig | None = None
+    # atomic 并发声明：parallelizable=False 或 self_exclusive=True 的技能
+    # 即使被 ReAct 规划器与其他动作同批返回，也会被调度器机械拆为单独一波
+    parallelizable: bool = True
+    self_exclusive: bool = False
     # 兜底规划时的步骤顺序提示（越小越靠前），默认 100
     order: int = 100
 

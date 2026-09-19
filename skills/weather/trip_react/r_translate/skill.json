@@ -1,0 +1,8 @@
+{
+  "name": "文本翻译（ReAct）",
+  "description": "ReAct 动作：翻译文本，依赖往轮结果时在 arguments 中显式传 source_text 与 target_lang",
+  "type": "atomic",
+  "function": "translate_text",
+  "keywords": ["翻译", "译文", "英文"],
+  "order": 3
+}

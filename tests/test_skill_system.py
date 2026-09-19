@@ -3,6 +3,9 @@
 - 纯逻辑单测：加载器、原子函数、递归执行树、关键词匹配与兜底规划（无需 DB/LLM）
 - 集成测试：PostgreSQL 注册表 + LangGraph checkpoint 全链路 + 暂停/恢复
   （本机 PostgreSQL 不可用时自动 skip）
+
+新架构下集成测试以 chat_task 为粒度：先写 user 消息与 pending 任务，
+TaskGraph 以 thread_id=task_id 执行，断言任务终态与 checkpoint 记忆。
 """
 
 from __future__ import annotations
@@ -39,7 +42,10 @@ def test_loader_scan_level1_and_progressive():
 
     children = loader.load_children(weather)
     child_ids = {m.skill_id for m in children}
-    assert child_ids == {"weather.current", "weather.forecast", "weather.trip_plan"}
+    assert child_ids == {
+        "weather.current", "weather.forecast",
+        "weather.trip_plan", "weather.trip_react",
+    }
 
     trip_plan = loader.require("weather.trip_plan")
     assert trip_plan.type == "dynamic"
@@ -123,7 +129,7 @@ def test_keyword_match_and_fallback_plan():
     weather = loader.require("weather")
     children = loader.load_children(weather)
 
-    # 关键词直接命中动态技能
+    # 关键词直接命中动态技能（trip_react 的关键词不含“出行/规划”，不会抢匹配）
     chosen = graph_mod.match_skill(children, "帮我做出行天气规划")
     assert chosen.skill_id == "weather.trip_plan"
 
@@ -173,15 +179,30 @@ def _force_keyword_paths(monkeypatch) -> None:
     )
 
 
-async def _run(rt, app, chat_id, content, command=None):
-    from langchain_core.messages import HumanMessage
+def _create_task(content: str, entry_skill_id: str,
+                 session_id: str = "it-session") -> str:
+    """写一条 user 消息 + 一个 pending 任务并关联，返回 task_id。"""
+    from src.db import ChatRecord, ChatTask, db
 
-    config = {"configurable": {"thread_id": chat_id, "runtime": rt}}
-    await rt.mark_running(chat_id)
+    chat = ChatRecord(
+        chat_id=f"it-{uuid.uuid4().hex[:8]}",
+        session_id=session_id, role="user", content=content,
+    )
+    db.insert_message(chat)
+    task = ChatTask(
+        task_id=f"task-{uuid.uuid4().hex[:8]}",
+        session_id=session_id, title=entry_skill_id, content=content,
+        entry_skill_id=entry_skill_id, status="pending",
+    )
+    db.insert_task(task)
+    db.link_task_message(task.task_id, chat.chat_id)
+    return task.task_id
+
+
+async def _run(rt, app, task_id, command=None):
+    config = {"configurable": {"thread_id": task_id, "runtime": rt}}
     initial = {
-        "messages": [HumanMessage(content=content)],
-        "chat_id": chat_id,
-        "user_input": content,
+        "task_id": task_id,
         "status": S.RUNNING,
         "level": 0,
         "skill_id": "",
@@ -196,7 +217,7 @@ async def _run(rt, app, chat_id, content, command=None):
 
 @pg_required
 async def test_graph_dynamic_nested_and_checkpoint(monkeypatch):
-    from src.db import ChatRecord, db
+    from src.db import db
     from src.skill_runtime.graph import Runtime, build_graph, get_memory
     from src.skill_runtime.scanner import SkillScanner
 
@@ -217,17 +238,15 @@ async def test_graph_dynamic_nested_and_checkpoint(monkeypatch):
         deep_prefetched = row["n"]
     assert deep_prefetched == 0
 
-    chat_id = f"it-{uuid.uuid4().hex[:8]}"
-    db.upsert_chat(ChatRecord(
-        chat_id=chat_id,
-        content="我要去上海出差3天，帮我做出行天气规划，并给出中文简报",
-        status="pending",
-    ))
+    task_id = _create_task(
+        "我要去上海出差3天，帮我做出行天气规划，并给出中文简报",
+        entry_skill_id="weather",
+    )
 
     async with Runtime(loader=loader) as rt:
         app = build_graph(rt)
-        await _run(rt, app, chat_id, db.get_chat(chat_id).content)
-        mem = await get_memory(rt, app, chat_id)
+        await _run(rt, app, task_id)
+        mem = await get_memory(rt, app, task_id)
 
         assert mem["status"] == S.COMPLETED
         assert mem["tree"].skill_id == "weather"
@@ -253,15 +272,16 @@ async def test_graph_dynamic_nested_and_checkpoint(monkeypatch):
         assert db.get_skill("weather.trip_plan") is not None
         assert db.get_skill("weather.trip_plan.briefing") is not None
 
-    row = db.get_chat(chat_id)
-    assert row.status == "completed" and row.response
+    task = db.get_task(task_id)
+    assert task.status == "completed" and task.output
+    assert "上海" in task.output and "预报" in task.output
 
 
 @pg_required
-async def test_graph_pause_and_resume_by_chat_id(monkeypatch):
+async def test_graph_pause_and_resume_by_task_id(monkeypatch):
     from langgraph.types import Command
 
-    from src.db import ChatRecord, db
+    from src.db import db
     from src.skill_runtime.graph import Runtime, build_graph, get_memory
 
     _force_keyword_paths(monkeypatch)
@@ -269,50 +289,51 @@ async def test_graph_pause_and_resume_by_chat_id(monkeypatch):
     db.init_schema()
     loader = SkillLoader()
 
-    chat_id = f"it-{uuid.uuid4().hex[:8]}"
-    content = "我要去上海出差3天，帮我做出行天气规划，并给出中文简报"
-    db.upsert_chat(ChatRecord(chat_id=chat_id, content=content, status="pending"))
+    task_id = _create_task(
+        "我要去上海出差3天，帮我做出行天气规划，并给出中文简报",
+        entry_skill_id="weather",
+    )
 
     async with Runtime(loader=loader) as rt:
         app = build_graph(rt)
-        config = {"configurable": {"thread_id": chat_id, "runtime": rt}}
+        config = {"configurable": {"thread_id": task_id, "runtime": rt}}
 
-        # 启动前即请求暂停：应在第一个步骤边界挂起
-        db.request_pause(chat_id)
-        from langchain_core.messages import HumanMessage
+        # 启动前即请求暂停；enter_task 的 mark_running 会清暂停标记，
+        # 测试中将其替换为 no-op，确定性地模拟“暂停位在首轮步骤边界仍有效”
+        async def noop_mark_running(_task_id: str) -> None:
+            return None
 
-        await rt.mark_running(chat_id)
-        # mark_running 会清暂停标记，这里重新置位模拟“运行中被请求暂停”
-        db.request_pause(chat_id)
+        rt.mark_running = noop_mark_running
+        db.request_task_pause(task_id)
+
         initial = {
-            "messages": [HumanMessage(content=content)],
-            "chat_id": chat_id, "user_input": content,
-            "status": S.RUNNING, "level": 0, "skill_id": "", "cursor": [],
+            "task_id": task_id, "status": S.RUNNING,
+            "level": 0, "skill_id": "", "cursor": [],
         }
         async for _ in app.astream(initial, config, stream_mode="updates"):
             pass
 
-        paused = await get_memory(rt, app, chat_id)
-        # 已路由到 weather -> trip_plan 动态技能，但步骤未执行
+        paused = await get_memory(rt, app, task_id)
+        # 已下探到 weather 根节点，但动态步骤未执行
         assert paused["tree"].skill_id == "weather"
-        assert db.get_chat(chat_id).status == "paused"
+        assert db.get_task(task_id).status == "paused"
 
-        # 凭 chat_id 恢复，跑到完成
-        db.request_resume(chat_id)
+        # 凭 task_id 恢复，跑到完成
+        db.request_task_resume(task_id)
         async for _ in app.astream(
             Command(resume={"resume": True}), config, stream_mode="updates"
         ):
             pass
-        final = await get_memory(rt, app, chat_id)
+        final = await get_memory(rt, app, task_id)
         assert final["status"] == S.COMPLETED
         assert "上海" in final["final_answer"]
 
-    assert db.get_chat(chat_id).status == "completed"
+    assert db.get_task(task_id).status == "completed"
 
 
 @pg_required
 async def test_graph_atomic_level1_and_level2(monkeypatch):
-    from src.db import ChatRecord, db
+    from src.db import db
     from src.skill_runtime.graph import Runtime, build_graph, get_memory
 
     _force_keyword_paths(monkeypatch)
@@ -324,20 +345,20 @@ async def test_graph_atomic_level1_and_level2(monkeypatch):
         app = build_graph(rt)
 
         # 一级原子技能（function_call）
-        cid1 = f"it-{uuid.uuid4().hex[:8]}"
-        db.upsert_chat(ChatRecord(chat_id=cid1, content="讲个笑话", status="pending"))
-        await _run(rt, app, cid1, "讲个笑话")
-        mem1 = await get_memory(rt, app, cid1)
+        task1 = _create_task("讲个笑话", entry_skill_id="chat")
+        await _run(rt, app, task1)
+        mem1 = await get_memory(rt, app, task1)
         assert mem1["status"] == S.COMPLETED
         assert mem1["tree"].node_type == "atomic"
         assert mem1["tree"].function == "chat_reply"
+        assert db.get_task(task1).status == "completed"
 
         # category 下探到二级原子技能
-        cid2 = f"it-{uuid.uuid4().hex[:8]}"
-        db.upsert_chat(ChatRecord(chat_id=cid2, content="把 hello 翻译成中文", status="pending"))
-        await _run(rt, app, cid2, "把 hello 翻译成中文")
-        mem2 = await get_memory(rt, app, cid2)
+        task2 = _create_task("把 hello 翻译成中文", entry_skill_id="translate")
+        await _run(rt, app, task2)
+        mem2 = await get_memory(rt, app, task2)
         assert mem2["tree"].skill_id == "translate"
         leaf = mem2["tree"].steps[0]
         assert leaf.skill_id == "translate.text" and leaf.status == S.COMPLETED
         assert leaf.output == "你好"
+        assert db.get_task(task2).status == "completed"

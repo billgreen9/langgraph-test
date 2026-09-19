@@ -1,0 +1,11 @@
+{
+  "name": "出行 ReAct 智能规划",
+  "description": "ReAct 范式：每轮由大模型基于已观测结果规划下一批可并发的原子动作（天气/预报/翻译），信息足够后综合给出简报",
+  "type": "react",
+  "keywords": ["react", "ReAct", "智能", "并发", "智能规划"],
+  "order": 4,
+  "react": {
+    "max_rounds": 4,
+    "objective_hint": "天气与预报互不依赖，应在同一批并发调用；翻译/简报需要往轮结果时把所需文本显式放入 arguments；信息齐备后 done 并给出中文出行简报。"
+  }
+}

@@ -1,7 +1,8 @@
 """LangGraph 记忆（checkpoint state）。
 
 记忆中包含：
-- ``chat_id``：聊天 id，作为 LangGraph thread_id，后续凭它启动/暂停/恢复
+- ``task_id``：任务 id，作为 LangGraph thread_id，后续凭它启动/暂停/恢复
+- ``session_id``：会话 id（消息归并/结果聚合作用域）
 - ``status``：整体运行状态（running/planning/paused/completed/failed）
 - ``level``：当前执行深度
 - ``skill_id``：当前执行的技能 id
@@ -12,6 +13,7 @@
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Annotated, Any, TypedDict
@@ -63,7 +65,14 @@ class SkillExecutionNode(BaseModel):
     # dynamic 技能的规划结果
     plan: list[PlanStep] = Field(default_factory=list)
     step_index: int = 0
-    # 递归数组：子技能执行节点（dynamic 可有多个；category 只有被选中的 1 个）
+    # react 技能的增量规划状态
+    react_round: int = 0  # 已进入的思考轮次（从 1 开始）
+    react_max_rounds: int = 5
+    # 当前轮待并发执行的动作批次（think 写入、fan-out 边读取、join 清空）
+    react_pending: list[dict[str, Any]] = Field(default_factory=list)
+    # skill_id -> 失败次数，用于限制同一动作反复重试
+    react_retries: dict[str, int] = Field(default_factory=dict)
+    # 递归数组：子技能执行节点（dynamic/react 可有多个；category 只有被选中的 1 个）
     steps: list[SkillExecutionNode] = Field(default_factory=list)
 
     output: str | None = None
@@ -78,7 +87,9 @@ SkillExecutionNode.model_rebuild()
 # ---------- LangGraph state ----------
 class AgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
-    chat_id: str
+    # TaskGraph 的执行身份：thread_id = task_id；session_id 为消息归并/聚合作用域
+    task_id: str
+    session_id: str
     user_input: str
     status: str
     level: int
@@ -86,6 +97,9 @@ class AgentState(TypedDict, total=False):
     # 游标路径：tree.steps 上的索引序列，[] 表示根节点
     cursor: list[int]
     tree: SkillExecutionNode
+    # ReAct 并行分支结果扇入通道：各 parallel_execute 分支只写这里，
+    # 由 react_join 按轮次（round）消费并合入 tree。元素为原生类型 dict。
+    branch_results: Annotated[list[dict[str, Any]], operator.add]
     final_answer: str
 
 
