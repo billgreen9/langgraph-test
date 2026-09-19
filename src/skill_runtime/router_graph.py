@@ -1,14 +1,21 @@
 """意图路由 LangGraph（RouterGraph）。
 
-职责单一：读取一条 user 消息（chat_record）→ 用 skills/intents/*.md 意图技能
-识别意图 → 生成一个 pending 的 chat_task（entry_skill_id 指向一级业务技能）
-并写入消息-任务关联。本图不执行任何业务技能。
+职责单一：把一条 user 消息（chat_record）转换为一个可执行的 chat_task。
+本图不执行任何业务技能，只做「消息 → 任务」的路由与落库。
 
-P1：一条消息固定产出一个任务；多意图拆分与跨消息归并在 P2 引入。
+流程（5 节点 1 分支）：
 
-    START → route_message → END
+    START → load_message → route_intents → (create | attach) → persist → END
+
+- load_message : 读取消息内容与会话信息载入 state（消息不存在则失败）
+- route_intents: 用 skills/intents/*.md 意图技能识别意图（关键词 → LLM → 兜底），
+  并判定分支：消息已关联非终态任务 → attach（幂等重跑护栏；P2 扩展为
+  collecting 任务的跨消息归并）；否则 → create（P1 主路径：新建任务）
+- create / attach : 仅产出任务标识，不写库（create 生成新 id；attach 复用已有 id）
+- persist      : 唯一写库点——insert chat_task + 建立消息-任务多对多关联
 
 checkpoint thread_id = chat_id（消息 id）。
+P1：一条消息固定产出一个任务；多意图拆分与跨消息归并在 P2 引入。
 """
 
 from __future__ import annotations
@@ -29,12 +36,25 @@ from .intent_loader import IntentLoader, IntentSpec
 
 logger = logging.getLogger(__name__)
 
+# 非终态任务状态：可被 attach 复用（终态 completed/failed 不可复用）
+OPEN_TASK_STATUSES = {"collecting", "pending", "running", "paused"}
+
 
 class RouterState(TypedDict, total=False):
     chat_id: str
-    task_id: str
-    entry_skill_id: str
+    # load_message 载入
+    session_id: str
+    user_id: str | None
+    message_content: str
+    # route_intents 产出
     intent_id: str
+    entry_skill_id: str
+    title: str
+    mode: str  # create / attach
+    existing_task_ids: list[str]
+    # create / attach 产出
+    task_id: str
+    task_ids: list[str]
 
 
 class LlmIntentChoice(BaseModel):
@@ -96,16 +116,28 @@ def match_intent(
 
 
 # ---------- 图节点 ----------
-async def route_message_node(
+async def load_message_node(
     state: RouterState, config: RunnableConfig
 ) -> dict[str, Any]:
-    """读取消息 → 匹配意图 → 落一个 pending 任务并关联消息。"""
-    rt = _runtime(config)
+    """读取 user 消息，把内容与会话信息载入 state。"""
     chat_id = state["chat_id"]
-
     message = await asyncio.to_thread(db.messages.get, chat_id)
     if message is None:
         raise ValueError(f"聊天消息不存在：{chat_id}")
+    return {
+        "session_id": message.session_id,
+        "user_id": message.user_id,
+        "message_content": message.content,
+    }
+
+
+async def route_intents_node(
+    state: RouterState, config: RunnableConfig
+) -> dict[str, Any]:
+    """意图识别 + create/attach 分支判定（只决策，不写库）。"""
+    rt = _runtime(config)
+    chat_id = state["chat_id"]
+    text = state["message_content"]
 
     intents = IntentLoader().load_all()
     # 入口技能闭环校验：每个 intent.entry_skill 必须是存在的一级业务技能
@@ -117,30 +149,90 @@ async def route_message_node(
             f"没有 entry_skill 命中一级业务技能 {sorted(valid_ids)} 的有效意图"
         )
 
-    spec = match_intent(intents, message.content, rt)
-    task = ChatTask(
-        task_id=f"task-{uuid.uuid4().hex[:8]}",
-        session_id=message.session_id,
-        title=spec.name,
-        content=message.content,
-        entry_skill_id=spec.entry_skill,
-        status="pending",
+    spec = match_intent(intents, text, rt)
+
+    # 分支判定：消息已关联非终态任务 → attach（幂等重跑护栏；P2 扩展为跨消息归并）
+    linked = await asyncio.to_thread(
+        db.task_messages.list_tasks_for_message, chat_id
     )
-    await asyncio.to_thread(db.tasks.insert, task)
-    await asyncio.to_thread(db.task_messages.link, task.task_id, chat_id)
-    logger.info("[router] chat_id=%s 意图=%s -> task_id=%s entry=%s",
-                chat_id, spec.intent_id, task.task_id, spec.entry_skill)
+    open_ids = [t.task_id for t in linked if t.status in OPEN_TASK_STATUSES]
+    mode = "attach" if open_ids else "create"
+    logger.info("[router] chat_id=%s 意图=%s 分支=%s",
+                chat_id, spec.intent_id, mode)
     return {
-        "chat_id": chat_id,
-        "task_id": task.task_id,
         "intent_id": spec.intent_id,
         "entry_skill_id": spec.entry_skill,
+        "title": spec.name,
+        "mode": mode,
+        "existing_task_ids": open_ids,
     }
+
+
+async def create_node(
+    state: RouterState, config: RunnableConfig
+) -> dict[str, Any]:
+    """create 分支：生成新任务标识（不写库，写库统一在 persist）。"""
+    task_id = f"task-{uuid.uuid4().hex[:8]}"
+    logger.info("[router] chat_id=%s 新建任务 %s -> %s",
+                state["chat_id"], task_id, state["entry_skill_id"])
+    return {"task_id": task_id, "task_ids": [task_id]}
+
+
+async def attach_node(
+    state: RouterState, config: RunnableConfig
+) -> dict[str, Any]:
+    """attach 分支：复用消息已关联的非终态任务（不写库，写库统一在 persist）。"""
+    logger.info("[router] chat_id=%s 挂接已有任务 %s",
+                state["chat_id"], state["existing_task_ids"])
+    return {"task_ids": list(state["existing_task_ids"])}
+
+
+async def persist_node(
+    state: RouterState, config: RunnableConfig
+) -> dict[str, Any]:
+    """唯一写库点：create 落新任务，attach 补齐关联（link 幂等）。"""
+    chat_id = state["chat_id"]
+    if state["mode"] == "create":
+        task = ChatTask(
+            task_id=state["task_id"],
+            session_id=state["session_id"],
+            title=state["title"],
+            content=state["message_content"],
+            entry_skill_id=state["entry_skill_id"],
+            status="pending",
+        )
+        await asyncio.to_thread(db.tasks.insert, task)
+        await asyncio.to_thread(db.task_messages.link, task.task_id, chat_id)
+        logger.info("[router] chat_id=%s persist 任务=%s entry=%s",
+                    chat_id, task.task_id, task.entry_skill_id)
+    else:
+        for tid in state["task_ids"]:
+            await asyncio.to_thread(db.task_messages.link, tid, chat_id)
+        logger.info("[router] chat_id=%s persist 挂接任务=%s",
+                    chat_id, state["task_ids"])
+    return {}
+
+
+def _after_route_intents(state: RouterState) -> str:
+    """route_intents 出口：返回分支节点名（create | attach）。"""
+    return state["mode"]
 
 
 def build_router_graph(rt: Runtime):
     g = StateGraph(RouterState)
-    g.add_node("route_message", route_message_node)
-    g.add_edge(START, "route_message")
-    g.add_edge("route_message", END)
+    g.add_node("load_message", load_message_node)
+    g.add_node("route_intents", route_intents_node)
+    g.add_node("create", create_node)
+    g.add_node("attach", attach_node)
+    g.add_node("persist", persist_node)
+
+    g.add_edge(START, "load_message")
+    g.add_edge("load_message", "route_intents")
+    g.add_conditional_edges(
+        "route_intents", _after_route_intents,
+        {"create": "create", "attach": "attach"},
+    )
+    g.add_edge("create", "persist")
+    g.add_edge("attach", "persist")
+    g.add_edge("persist", END)
     return g.compile(checkpointer=rt.saver)
