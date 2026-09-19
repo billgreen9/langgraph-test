@@ -77,7 +77,9 @@ async def process_message(
         )
 
         # 2. 执行：与该消息关联的 pending 任务，各自独立 TaskGraph
-        tasks = await asyncio.to_thread(db.list_tasks_for_message, chat_id)
+        tasks = await asyncio.to_thread(
+            db.task_messages.list_tasks_for_message, chat_id
+        )
         pending = [t for t in tasks if t.status == "pending"]
         if not pending:
             raise RuntimeError(f"消息 {chat_id} 没有可执行的 pending 任务")
@@ -89,10 +91,10 @@ async def process_message(
 
         # 3. 回读终态并聚合
         final_tasks = [
-            await asyncio.to_thread(db.get_task, t.task_id) for t in pending
+            await asyncio.to_thread(db.tasks.get, t.task_id) for t in pending
         ]
         final_tasks = [t for t in final_tasks if t is not None]
-        message = await asyncio.to_thread(db.get_message, chat_id)
+        message = await asyncio.to_thread(db.messages.get, chat_id)
         answer = await _synthesize(rt, message.content if message else chat_id,
                                    final_tasks)
 
@@ -104,9 +106,9 @@ async def process_message(
             role="assistant",
             content=answer,
         )
-        await asyncio.to_thread(db.insert_message, assistant)
+        await asyncio.to_thread(db.messages.insert, assistant)
         for t in final_tasks:
-            await asyncio.to_thread(db.link_task_message, t.task_id, assistant.chat_id)
+            await asyncio.to_thread(db.task_messages.link, t.task_id, assistant.chat_id)
         logger.info("消息 %s 处理完成，assistant=%s，任务 %d 个",
                     chat_id, assistant.chat_id, len(final_tasks))
         return assistant
@@ -117,7 +119,7 @@ async def resume_one_task(task_id: str, *, loader: SkillLoader | None = None) ->
     loader = loader or SkillLoader()
     async with Runtime(loader=loader) as rt:
         app = build_graph(rt)
-        await asyncio.to_thread(db.request_task_resume, task_id)
+        await asyncio.to_thread(db.tasks.request_resume, task_id)
         return await resume_task(rt, app, task_id)
 
 

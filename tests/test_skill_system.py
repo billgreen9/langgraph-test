@@ -188,14 +188,14 @@ def _create_task(content: str, entry_skill_id: str,
         chat_id=f"it-{uuid.uuid4().hex[:8]}",
         session_id=session_id, role="user", content=content,
     )
-    db.insert_message(chat)
+    db.messages.insert(chat)
     task = ChatTask(
         task_id=f"task-{uuid.uuid4().hex[:8]}",
         session_id=session_id, title=entry_skill_id, content=content,
         entry_skill_id=entry_skill_id, status="pending",
     )
-    db.insert_task(task)
-    db.link_task_message(task.task_id, chat.chat_id)
+    db.tasks.insert(task)
+    db.task_messages.link(task.task_id, chat.chat_id)
     return task.task_id
 
 
@@ -269,10 +269,10 @@ async def test_graph_dynamic_nested_and_checkpoint(monkeypatch):
         assert "预报" in (translate_leaf.output or "")
 
         # 深层技能在执行过程中被渐进式缓存进 DB
-        assert db.get_skill("weather.trip_plan") is not None
-        assert db.get_skill("weather.trip_plan.briefing") is not None
+        assert db.skills.get("weather.trip_plan") is not None
+        assert db.skills.get("weather.trip_plan.briefing") is not None
 
-    task = db.get_task(task_id)
+    task = db.tasks.get(task_id)
     assert task.status == "completed" and task.output
     assert "上海" in task.output and "预报" in task.output
 
@@ -304,7 +304,7 @@ async def test_graph_pause_and_resume_by_task_id(monkeypatch):
             return None
 
         rt.mark_running = noop_mark_running
-        db.request_task_pause(task_id)
+        db.tasks.request_pause(task_id)
 
         initial = {
             "task_id": task_id, "status": S.RUNNING,
@@ -316,10 +316,10 @@ async def test_graph_pause_and_resume_by_task_id(monkeypatch):
         paused = await get_memory(rt, app, task_id)
         # 已下探到 weather 根节点，但动态步骤未执行
         assert paused["tree"].skill_id == "weather"
-        assert db.get_task(task_id).status == "paused"
+        assert db.tasks.get(task_id).status == "paused"
 
         # 凭 task_id 恢复，跑到完成
-        db.request_task_resume(task_id)
+        db.tasks.request_resume(task_id)
         async for _ in app.astream(
             Command(resume={"resume": True}), config, stream_mode="updates"
         ):
@@ -328,7 +328,7 @@ async def test_graph_pause_and_resume_by_task_id(monkeypatch):
         assert final["status"] == S.COMPLETED
         assert "上海" in final["final_answer"]
 
-    assert db.get_task(task_id).status == "completed"
+    assert db.tasks.get(task_id).status == "completed"
 
 
 @pg_required
@@ -351,7 +351,7 @@ async def test_graph_atomic_level1_and_level2(monkeypatch):
         assert mem1["status"] == S.COMPLETED
         assert mem1["tree"].node_type == "atomic"
         assert mem1["tree"].function == "chat_reply"
-        assert db.get_task(task1).status == "completed"
+        assert db.tasks.get(task1).status == "completed"
 
         # category 下探到二级原子技能
         task2 = _create_task("把 hello 翻译成中文", entry_skill_id="translate")
@@ -361,4 +361,4 @@ async def test_graph_atomic_level1_and_level2(monkeypatch):
         leaf = mem2["tree"].steps[0]
         assert leaf.skill_id == "translate.text" and leaf.status == S.COMPLETED
         assert leaf.output == "你好"
-        assert db.get_task(task2).status == "completed"
+        assert db.tasks.get(task2).status == "completed"

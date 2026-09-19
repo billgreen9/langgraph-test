@@ -103,7 +103,7 @@ async def route_message_node(
     rt = _runtime(config)
     chat_id = state["chat_id"]
 
-    message = await asyncio.to_thread(db.get_message, chat_id)
+    message = await asyncio.to_thread(db.messages.get, chat_id)
     if message is None:
         raise ValueError(f"聊天消息不存在：{chat_id}")
 
@@ -126,8 +126,8 @@ async def route_message_node(
         entry_skill_id=spec.entry_skill,
         status="pending",
     )
-    await asyncio.to_thread(db.insert_task, task)
-    await asyncio.to_thread(db.link_task_message, task.task_id, chat_id)
+    await asyncio.to_thread(db.tasks.insert, task)
+    await asyncio.to_thread(db.task_messages.link, task.task_id, chat_id)
     logger.info("[router] chat_id=%s 意图=%s -> task_id=%s entry=%s",
                 chat_id, spec.intent_id, task.task_id, spec.entry_skill)
     return {

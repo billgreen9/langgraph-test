@@ -56,7 +56,7 @@ def wait_level1_loaded(loader: SkillLoader, timeout: float = 5.0) -> None:
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if db.get_level1_skills():
+        if db.skills.get_level1():
             return
         time.sleep(0.1)
     logger.warning("等待一级技能入库超时，继续执行（Router 有目录扫描兜底）")
@@ -87,7 +87,7 @@ def cmd_seed(text: str, session_id: str) -> str:
         role="user",
         content=text,
     )
-    db.insert_message(chat)
+    db.messages.insert(chat)
     print(f"已写入消息：{chat.chat_id}（session={session_id}）")
     return chat.chat_id
 
@@ -101,7 +101,7 @@ async def cmd_run(chat_id: str) -> None:
     finally:
         scanner.stop(timeout=2)
 
-    tasks = db.list_tasks_for_message(chat_id)
+    tasks = db.task_messages.list_tasks_for_message(chat_id)
     print("\n>>> 关联任务：")
     for t in tasks:
         print(f"- {t.task_id}  [{t.status}]  {t.title} -> {t.entry_skill_id}")
@@ -115,7 +115,7 @@ async def cmd_resume(task_id: str) -> None:
     except GraphInterrupt:
         pass
     await cmd_state(task_id)
-    task = db.get_task(task_id)
+    task = db.tasks.get(task_id)
     if task:
         print(f"任务状态：{task.status}")
         if task.output:
@@ -127,13 +127,13 @@ async def cmd_state(task_id: str) -> None:
 
 
 def cmd_tasks(session_id: str | None) -> None:
-    for t in db.list_tasks(session_id=session_id):
+    for t in db.tasks.list(session_id=session_id):
         print(f"{t.task_id:14} {t.status:10} {t.session_id:12} "
               f"{t.entry_skill_id:12} {t.title}")
 
 
 def cmd_list() -> None:
-    for m in db.list_recent_messages():
+    for m in db.messages.list_recent():
         print(f"{m.chat_id:14} {m.session_id:12} {m.role:9} {m.content[:60]}")
 
 
@@ -161,7 +161,7 @@ def main() -> None:
             raise SystemExit("run 需要提供 chat_id（可先 seed 或用 demo）")
         asyncio.run(cmd_run(args.arg))
     elif args.command == "pause":
-        db.request_task_pause(args.arg)
+        db.tasks.request_pause(args.arg)
         print(f"已请求暂停任务 {args.arg}")
     elif args.command == "resume":
         asyncio.run(cmd_resume(args.arg))

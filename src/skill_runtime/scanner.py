@@ -43,11 +43,11 @@ class SkillScanner(threading.Thread):
             ids: list[str] = []
             for m in manifests:
                 row = SkillRow(**m.to_row(prefetched=True))
-                self.db.upsert_skill(row)
+                self.db.skills.upsert(row)
                 ids.append(m.skill_id)
             # 清理磁盘上已经删除的一级技能（深层渐进缓存不受影响）
             if ids:
-                self.db.prune_level1(set(ids))
+                self.db.skills.prune_level1(set(ids))
             logger.info("一级技能扫描完成：%s", ids or "<空>")
             return ids
 
