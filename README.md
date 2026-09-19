@@ -1,236 +1,287 @@
-# 项目
+# langgraph-test
 
-## 实现概览
+基于 **LangGraph** 的「意图路由 → 任务化技能执行」系统：用户发送一条消息，RouterGraph 识别意图并拆成任务落库，TaskGraph 为每个任务独立执行一棵可递归、可并发、可暂停恢复的技能树，最后聚合成一条回复。
 
-### 1. 后台线程定时加载一级技能
-- [scanner.py](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/scanner.py)：守护线程 `SkillScanner`，默认每 10 秒扫描一次 `skills/` 根目录，**只把一级技能** upsert 进 PostgreSQL 的 `skill_registry` 表（`prefetched=TRUE`），并自动清理已删除目录（已实测热增删生效）。
-- [loader.py](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/loader.py)：`scan_level1()` 只加载一层；`load_children()` 在运行时命中某技能后才展开**下一层**，实现渐进式加载，深层技能顺手以 `prefetched=FALSE` 缓存入库。
+两张图**独立编译、通过 PostgreSQL 表解耦**；技能以「目录 + `skill.json`」方式声明，采用**渐进式加载**。
 
-### 2. 三类技能（skills 多级目录）
-每个技能是一个含 `skill.json` 的目录，`skill_id` 由路径推导（如 `weather.trip_plan.briefing`）：
-- **category**：容器型，逐层下探匹配（`weather` → `trip_plan`）
-- **dynamic**：LLM 动态规划出有序步骤逐步执行，步骤可以再嵌套 dynamic（已实现 `trip_plan` → 嵌套 `briefing` 的 4 层深度示例）
-- **atomic**：原子 function_call，绑定 [functions.py](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/functions.py) 注册表中的 Python 函数（`get_weather`/`calc`/`translate_text`/`chat_reply`）；`chat` 本身就是一级原子技能
+## 核心特性
 
-### 3. LangGraph 记忆（PostgreSQL checkpoint）
-[state.py](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/state.py) 中的记忆包含你要求的全部字段：
-- **递归数组** `tree.steps`：记录执行中的所有动态技能及其子步骤，任意深度嵌套
-- `chat_id`：即 LangGraph `thread_id`
-- `status`：running/planning/paused/completed/failed
-- `level`：当前执行深度（已实测挂起时 level=2，最深执行到 level=4）
-- `skill_id`：当前技能
-- 每个节点（步骤）切换都经 `AsyncPostgresSaver` 写入 Postgres；步骤产物支持 `prev_output` 跨层传递（嵌套动态技能自动消费父级上一步产物）
+- **双图解耦**：RouterGraph（消息→任务，`thread_id=chat_id`）与 TaskGraph（任务→执行，`thread_id=task_id`）只通过 `chat_task` 表交互，任务间状态隔离，可独立伸缩。
+- **消息-任务多对多**：一条消息可拆多个任务、一个任务可归并多条消息（关联表 `chat_task_message`）。
+- **四类技能编排**：`category`（容器下探）、`atomic`（原子函数调用）、`dynamic`（LLM 顺序规划多步骤）、`react`（LLM 增量规划 + 同批动作并发扇出）。
+- **递归执行树**：技能步骤可任意深度嵌套，整棵树随 LangGraph checkpoint 持久化到 PostgreSQL，支持任务级暂停/恢复（含跨进程）。
+- **渐进式技能加载**：后台线程只预取一级技能，深层技能执行到时按需加载并缓存。
+- **可观测**：每次图调用带 `run_name` / `tags` / `metadata`，接入 LangSmith 即可追踪。
 
-### 4. 图与暂停/恢复
-[graph.py](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py)：`route → descend → plan → start_step → execute → complete → finish`，条件边驱动递归；暂停通过在步骤边界检查 DB 标志位并调用 `interrupt()` 挂起，凭 chat_id 用 `Command(resume=...)` 从 checkpoint 恢复。
-
-### 5. 数据库与主程序
-- [db.py](file:///Users/bill/PycharmProjects/langgraph-test/src/db.py)：psycopg3 连接池、`chat_records`（聊天记录+暂停标志+终态）、`skill_registry` 两张表
-- [main.py](file:///Users/bill/PycharmProjects/langgraph-test/src/main.py)：启动后台线程 → 从 DB 读取 pending 聊天 → 执行。CLI：
-  - `python -m src.main demo` 端到端演示（执行 1 步后自动暂停、打印记忆、再恢复跑完）
-  - `seed/run/pause/resume/state/list`，已验证**跨进程** `pause` → checkpoint 挂起 → 另一进程 `resume` 跑完
-
-### 验证结果
-- 9 个 pytest 用例全部通过（4 个纯逻辑 + 3 个 PG 集成，含暂停恢复、嵌套动态、一级/二级原子）
-- 真实 LLM（豆包）链路：规划出 3 步、嵌套简报规划、最终回答正确写回 DB
-- `ruff check` 与 IDE 诊断均无问题
-- 依赖已加入 pyproject：`psycopg[binary]`、`langgraph-checkpoint-postgres`；DSN 默认 `postgresql://postgres:123456@localhost:5432/graph-test`（复用了你已有的 pgvector-demo 容器，库名/密码正好匹配）
-- 离线快速验证可用 `SKILL_FORCE_KEYWORD=1`（跳过 LLM 走关键词兜底）
-
-# 七节点流程说明
-
-整个流程在 [graph.py](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py) 中实现，是一棵递归执行树的遍历过程，由条件边根据节点 `node_type`（atomic/category/dynamic）分流。
-
-## 节点职责
-
-### 1. [route_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L407-L415) — 一级路由
-- 从 DB 的 `skill_registry` 读取**后台线程预加载的一级技能**（渐进式加载第一层）
-- 用 `match_skill()`（关键词打分 → LLM 兜底）匹配用户输入
-- 创建根 `SkillExecutionNode`，cursor 置为根
-- **入口节点**，由 `START` 直连
-
-### 2. [descend_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L418-L438) — category 下探
-- 仅 **category 容器型节点**进入
-- 调用 `loader.load_children()` **渐进式加载**下一层子技能（运行时按需展开，非预加载）
-- 顺手 `persist_children()` 把深层技能缓存到 DB（`prefetched=FALSE`）
-- 在子技能中再匹配，append 为子节点，cursor 下移
-- 可多层嵌套（条件边自循环回 descend）
-
-### 3. [plan_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L441-L470) — dynamic 动态规划
-- 仅 **dynamic 节点**进入
-- 加载候选子技能，调用 [build_plan()](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L289-L335)：LLM 拆步骤（失败走 `_fallback_plan` 关键词兜底）
-- 限定 skill_id 必须在候选集合内，去重，最多 `planner.max_steps` 步
-- 把 `plan` 和 `step_index=0` 写入节点记忆
-- 直连 `start_step`
-
-### 4. [start_step_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L473-L500) — 步骤实例化
-- 从 dynamic 的 `plan[step_index]` 取下一步
-- **调用 `_pause_gate()`**：检查 DB 中 `pause_requested`，若为 TRUE 则 `interrupt()` 挂起 graph（这是暂停的确定性触发点）
-- 实例化对应子技能节点（可能是 atomic / category / dynamic，**支持再嵌套 dynamic**）
-- 标记该 PlanStep 为 RUNNING，cursor 下移到子节点
-
-### 5. [execute_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L503-L550) — atomic 执行
-- 仅 **atomic 节点**进入
-- 再次过 `_pause_gate()` 暂停闸门
-- 从 `FUNCTIONS` 注册表查函数，用 `_resolve_input()` 决定输入（user 或 prev_output，支持跨层向上回溯）
-- 执行 function_call，捕获异常 → 节点置 FAILED；成功 → 置 COMPLETED 并写 output
-- 触发 `rt.on_leaf` 钩子（主程序借此在原子步骤边界写暂停请求）
-- 直连 `complete`
-
-### 6. [complete_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L553-L590) — 收束与上推
-- 把当前节点 status 置 COMPLETED
-- 若是根节点 → 直接返回终态
-- 若父节点是 dynamic → 推进 `step_index`，上推 cursor 到父
-- 若父节点是根 category → 顺手把根也置 COMPLETED（根节点特殊收束，避免 status 卡在 running）
-- 由条件边 [_after_complete](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L624-L635) 决定下一步：
-  - FAILED → finish
-  - 父是 category → 继续自环 complete
-  - 父 dynamic 还有剩余步骤 → start_step
-  - 父 dynamic 步骤耗尽 → 自环 complete 收束自身
-
-### 7. [finish_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L598-L615) — 汇总与落库
-- `collect_leaf_outputs()` 收集所有原子节点输出
-- 调用 `rt.mark_terminal()` 把最终答案 + status（COMPLETED/FAILED）写回 `chat_records` 表
-- 打印整棵执行树视图 `tree_to_view()`
-- 返回 `final_answer` + `AIMessage`，连 END
-
-## 一图概括
+## 架构总览
 
 ```
-START→route ──┬─→ execute  (atomic 命中)
-              ├─→ descend ─→ ... (category 下探)
-              └─→ plan ──→ start_step ─┬─→ execute (atomic)
-                                       ├─→ descend (嵌套 category)
-                                       └─→ plan    (嵌套 dynamic，递归)
-execute → complete ─┬─→ start_step (dynamic 还有步骤)
-                    ├─→ complete   (继续上推收束)
-                    └─→ finish → END
+┌──────────────────────────── runner.process_message（编排层）────────────────────────────┐
+│                                                                                          │
+│  chat_record ──▶ RouterGraph ──▶ chat_task(pending) ──▶ TaskGraph × N (gather 并发)       │
+│   (user 消息)      消息→任务            ▲ 表解耦              任务→技能执行树               │
+│                                                                                          │
+│                         回读终态 → _synthesize 聚合 → chat_record(assistant)              │
+└──────────────────────────────────────────┬───────────────────────────────────────────────┘
+                                           │
+              PostgreSQL：chat_record / chat_task / chat_task_message / skill_registry
+              LangGraph checkpoint：AsyncPostgresSaver（thread_id = task_id）
 ```
 
-核心机制：**条件边按 `node_type` 分流**，**complete 自环实现递归上推**，**`_pause_gate` 在 start_step 与 execute 两处检查暂停标志**实现跨进程暂停/恢复。
+### 一条消息的生命周期
 
+1. `seed`：user 消息写入 `chat_record`。
+2. `run` 调用 RouterGraph：意图识别 → 写 `chat_task(pending)` + 消息关联。
+3. 编排层查出该消息的全部 pending 任务，`asyncio.gather` 各起一个 TaskGraph 执行。
+4. TaskGraph 沿技能树下探/规划/ReAct 并发执行，`finish` 节点回写任务终态（completed/failed + output/error）。
+5. 回读终态 → `_synthesize` 聚合（单任务直出；多任务 LLM 综合，失败降级拼接）→ 写 assistant 消息并关联回任务。
 
-# skills中三种节点类型的作用
+## RouterGraph：消息 → 任务
 
-类型在 [skill.json](file:///Users/bill/PycharmProjects/langgraph-test/skills/weather/skill.json) 的 `type` 字段声明，由 [NEXT_BY_TYPE](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L57) 映射决定进入哪个图节点：
+```
+START → load_message → route_intents → (create | attach) → persist → END
+```
+
+| 节点 | 职责 |
+|---|---|
+| `load_message` | 读取消息内容与会话信息载入 state |
+| `route_intents` | 意图识别（关键词打分 → 0 命中才 LLM 裁决 → `chat` 兜底）+ 判定 create/attach |
+| `create` / `attach` | 只产出任务 id，不写库 |
+| `persist` | **唯一写库点**：create 落新任务并关联消息；attach 幂等补关联 |
+
+分支判定：消息已关联非终态任务（collecting/pending/running/paused）→ `attach`（P1 作为幂等重跑护栏，P2 扩展为跨消息归并）；否则 `create`。
+
+意图定义为 `skills/intents/*.md`（YAML front matter：`intent_id / name / keywords / entry_skill / order` + Markdown 说明正文），入口技能必须命中一级业务技能。
+
+## TaskGraph：任务 → 技能执行树
+
+四类技能由 `NEXT_BY_TYPE` 映射到不同入口节点：
+
+| 类型 | 行为 | 入口节点 |
+|---|---|---|
+| `category` | 容器，按关键词在子技能中选 1 个继续下探 | `descend` |
+| `atomic` | 叶子，调用 `FUNCTIONS` 注册表中的一个 Python 函数 | `execute` |
+| `dynamic` | LLM 一次性规划为有序步骤逐步执行，步骤可再嵌套 | `plan → start_step` |
+| `react` | 每轮 LLM 增量规划一批**可并发**原子动作，观察后再决策 | `react_think → Send 扇出 → parallel_execute → react_join` |
+
+```
+START → enter_task ─┬─ atomic ───▶ execute ───────────────┐
+                    ├─ category ─▶ descend（再分流）        │
+                    ├─ dynamic ──▶ plan → start_step        ├─▶ complete ─┐
+                    └─ react ────▶ react_think              │             │
+                                      ├─ done ─────────────▶ complete     │
+                                      └─ Send×N → parallel_execute        │
+                                                   → react_join → 下一轮  │
+                  execute / 步骤完成 → complete ─还有步骤? start_step┘     │
+                                                       └─收束─▶ finish → END
+```
+
+### 递归执行树
+
+- 状态中的 `tree` 是 `SkillExecutionNode` 递归结构，`cursor`（索引路径）定位当前节点；category 有 1 个选中子节点，dynamic/react 可有多个，形成任意深度递归。
+- dynamic 节点用 `plan`（规划蓝图）+ `step_index`（进度指针）+ `steps`（已实例化的执行轨迹，与 plan 下标对齐）三件套支持步骤推进、暂停恢复与嵌套。
+- 所有树改动走 `model_copy(deep=True)` 纯函数式更新，保证 checkpoint 可追踪。
+
+### ReAct 并发
+
+- `react_think` 输出结构化 `ReactDecision`（`done / final_answer / actions[]`），`_after_react_think` 用 LangGraph `Send` 把同批动作扇出。
+- `parallel_execute` 用 `asyncio.to_thread` 跑同步函数；各分支只写 `branch_results`（`operator.add` reducer），`react_join` 屏障合入树。
+- 护栏：`max_rounds` 轮次上限、动作校验与指纹去重、失败重试上限；`parallelizable=false` 或 `self_exclusive=true` 的原子技能会被机械拆为单独一波。
+
+### 暂停 / 恢复
+
+任务粒度。`pause_requested` 闸门位于 `start_step` / `execute` / `react_think`（react 在轮次边界），interrupt 在节点变更 tree 之前调用，恢复时整节重放不重复计数；`mark_running` 会清除暂停位，因此暂停只在下一个步骤边界生效。
+
+## 技能体系
+
+### 声明方式
+
+每个技能是一个含 `skill.json` 的目录，`skill_id` 由目录路径推导：
+
+```
+skills/weather/trip_react/r_current/skill.json  →  skill_id = weather.trip_react.r_current
+```
+
+`skill.json` 示例（react 类型）：
+
+```json
+{
+  "name": "出行 ReAct 智能规划",
+  "type": "react",
+  "keywords": ["react", "智能", "并发", "智能规划"],
+  "order": 4,
+  "react": { "max_rounds": 4, "objective_hint": "天气与预报互不依赖，应同批并发..." }
+}
+```
+
+### 函数注册（不使用 OpenAI tools 协议）
+
+LLM 只输出 Pydantic 结构化 JSON（skill_id + arguments），执行层按名查表调用 Python 函数：
 
 ```python
-NEXT_BY_TYPE = {"atomic": "execute", "category": "descend", "dynamic": "plan"}
+FUNCTIONS: dict[str, dict] = {}
+
+@register_function("calc")
+def calc(text: str = "", expr: str | None = None, **_) -> str:
+    ...
 ```
 
-## 1. atomic — 原子 function_call
-**叶子节点，真正干活的**。
-- 进入 [execute_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L503)，调用 `FUNCTIONS[function]` 执行一次函数调用
-- 产生 `output`，是执行树唯一产出实际结果的地方
-- 失败置 FAILED，成功置 COMPLETED
-- 例：`weather.current`（get_weather）、`calc.math`（calc）、`chat`（chat_reply 兜底闲聊）
+- atomic 技能在 `skill.json` 的 `"function"` 字段绑定函数名。
+- 所有函数统一签名：`fn(text: str, **arguments) -> str`，`text` 为用户原话或上一步产物。
+- 已注册函数：`get_weather`、`get_weather_forecast`、`translate_text`、`calc`、`chat_reply`。
 
-## 2. category — 容器/目录型
-**组织用，自身不执行任何逻辑，只做下探**。
-- 进入 [descend_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L418)，加载子技能并匹配一个继续向下
-- 不产生 output，最终输出靠 `collect_leaf_outputs` 收集子树所有原子结果
-- 作用：**构建多级目录树**，让技能按领域分组（weather → current/forecast/trip_plan）
-- 可多层嵌套（category 套 category 也行）
-- 例：`weather`（一级 category，order=1）、`translate`、`calc`
+### 渐进式加载
 
-## 3. dynamic — 动态规划型
-**运行时按用户意图拆步骤、按顺序编排多个子技能**。
-- 进入 [plan_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L441)，用 LLM（或关键词兜底）把请求拆成有序 `PlanStep` 列表
-- 维护 `plan` + `step_index`，由 [start_step_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L473) 逐个实例化子节点执行
-- 步骤间可传递产物（`input_from="prev_output"`）
-- **支持嵌套**：某个 step 可以是 dynamic，从而在 plan→start_step→plan 之间递归
-- 例：`weather.trip_plan`（出差规划，动态拆成 查天气→查预报→出简报）、`trip_plan.briefing`（嵌套 dynamic，再拆 翻译→总结）
+- `SkillScanner` 守护线程默认每 10 秒扫描 `skills/` 根目录，只把一级技能 upsert 进 `skill_registry`（`prefetched=true`），并清理已删除目录（支持热增删）。
+- `SkillLoader.require(skill_id)` 在执行命中时才加载深层技能，并以 `prefetched=false` 顺手缓存入库。
+- `skills/intents/` 下是意图 `.md`，不含 `skill.json`，不会被技能扫描器收录。
 
-## 三者的协作关系
+## 数据模型（PostgreSQL）
 
-以"出差去北京三天，给我中文简报"为例：
+数据访问层位于 `src/db/`，按表一个仓储模块；`Database` 只管理连接池与建表，通过属性暴露各仓储：
 
-```
-weather (category)              ← 下探
-└─ trip_plan (dynamic)          ← 规划 3 步
-   ├─ weather_check (atomic)    ← 执行：北京天气
-   ├─ forecast_check (atomic)   ← 执行：3 天预报
-   └─ briefing (dynamic)        ← 嵌套规划 2 步
-      ├─ translate_brief (atomic) ← 执行：翻译
-      └─ chat_brief (atomic)      ← 执行：生成简报
-```
+| 表 | 仓储入口 | 说明 |
+|---|---|---|
+| `chat_record` | `db.messages` | 纯聊天时间线（chat_id / session_id / role / content），不含执行态 |
+| `chat_task` | `db.tasks` | 任务：status（collecting/pending/running/paused/completed/failed）、entry_skill_id、arguments、output/error、暂停控制 |
+| `chat_task_message` | `db.task_messages` | 任务↔消息多对多关联（UNIQUE task_id+chat_id） |
+| `skill_registry` | `db.skills` | 技能注册表（一级预取 + 深层渐进缓存） |
 
-- **category** 负责"组织分层"（静态目录结构）
-- **dynamic** 负责"运行时编排"（按请求动态拆步骤）
-- **atomic** 负责"实际产出"（唯一产生 output 的节点）
+包内文件：`models.py`（表模型）、`schema.py`（DDL）、`base.py`（仓储基类）、`chat_record.py` / `chat_task.py` / `chat_task_message.py` / `skill_registry.py`（四表仓储）、`database.py`（组合根 + 单例 `db`）。
 
-三者通过 `_classify` 条件边分流，`complete_node` 自环实现递归上推收束，最终所有 atomic 的 output 在 [finish_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L598) 汇总成最终答案。
+首次启动自动建表；检测到旧版单体 `chat_records` 表（含 status 列）会自动 DROP 重建（旧数据不迁移）。
 
-
-
-# SkillExecutionNode 中 `plan` / `steps` / `step_index` 三者关系与作用
-
-三者只对 **dynamic 节点**有意义（atomic/category 节点的 `plan` 为空、`step_index` 恒为 0）。它们构成 dynamic 节点的"规划—执行—推进"三件套：
-
-## 各自的职责
-
-| 字段 | 类型 | 角色 | 比喻 |
-|------|------|------|------|
-| `plan` | `list[PlanStep]` | **规划蓝图**：LLM 规划出的有序步骤清单（skill_id / objective / arguments / input_from / status） | 菜谱 |
-| `step_index` | `int` | **进度指针**：指向 `plan` 中**下一个要执行**的步骤下标 | 翻到第几页 |
-| `steps` | `list[SkillExecutionNode]` | **执行轨迹**：已实例化的子执行节点（递归树），带真实 output/status | 做出来的菜 |
-
-## 生命周期（一个 dynamic 节点的完整流程）
-
-以 `trip_plan` 规划出 3 步为例：
+## 目录结构
 
 ```
-plan_node 阶段：
-  plan = [weather_check, forecast_check, briefing]
-  step_index = 0
-  steps = []
-  ──────────────────────────────────────────────
-
-第 1 轮：start_step(step_index=0)
-  读 plan[0] → 实例化 weather_check 节点 → append 到 steps
-  steps = [weather_check]   ← len(steps) == step_index + 1
-  complete 后：step_index = 1, plan[0].status = COMPLETED
-
-第 2 轮：start_step(step_index=1)
-  读 plan[1] → 实例化 forecast_check → append
-  steps = [weather_check, forecast_check]
-  complete 后：step_index = 2, plan[1].status = COMPLETED
-
-第 3 轮：start_step(step_index=2)
-  读 plan[2] → 实例化 briefing（本身是 dynamic，递归进入 plan→start_step...）
-  steps = [weather_check, forecast_check, briefing]
-  complete 后：step_index = 3, plan[2].status = COMPLETED
-
-_after_complete 判断：step_index(3) >= len(plan)(3) → 走 complete 收束自身
+langgraph-test/
+├── src/
+│   ├── main.py                  # CLI 入口：demo/seed/run/pause/resume/state/tasks/list
+│   ├── runner.py                # 编排层：router → 任务并发执行 → 聚合写 assistant
+│   ├── config.py                # 环境变量配置（LLM / PG DSN / 连接池 / 扫描间隔）
+│   ├── db/                      # 数据访问层（按表拆分的仓储包，见上）
+│   └── skill_runtime/
+│       ├── router_graph.py      # RouterGraph：load_message→route_intents→create/attach→persist
+│       ├── graph.py             # TaskGraph：技能执行引擎 + Runtime + start/resume/get_memory
+│       ├── state.py             # AgentState、递归执行树 SkillExecutionNode/PlanStep
+│       ├── schema.py            # SkillManifest（skill.json 模型，四类技能）
+│       ├── loader.py            # 技能加载器（一级扫描 + 深层按需 require）
+│       ├── scanner.py           # 后台守护线程 SkillScanner
+│       ├── intent_loader.py     # skills/intents/*.md 解析
+│       └── functions.py         # @register_function 函数注册表
+├── skills/
+│   ├── intents/                 # 意图定义（Markdown + YAML front matter）
+│   ├── weather/  calc/  chat/  translate/   # 业务技能树（每目录一个 skill.json）
+└── tests/                       # pytest（真实 PG 集成测试 + ReAct 单测，14 例）
 ```
 
-## 对应关系
+> `src/graph.py`、`src/IntentRouter.py` 为早期单体 demo 遗留，当前架构未使用。
 
-核心不变量：**`plan[i]` ↔ `steps[i]`**（下标对齐）
+## 快速开始
 
+### 1. 准备 PostgreSQL
+
+```bash
+open -a Docker
+docker start pgvector-demo        # pgvector/pgvector:pg16，映射 5432
 ```
-plan:  [step0,   step1,   step2]
-          ↓       ↓       ↓
-steps: [node0,   node1,   node2]
-          ↑
-      已完成(i < step_index) / 进行中(i == step_index) / 未开始(i > step_index)
+
+默认连接串：`postgresql://postgres:123456@localhost:5432/graph-test`
+（可用环境变量 `POSTGRES_DSN` 覆盖）。
+
+### 2. 安装依赖
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
-- `i < step_index`：`plan[i]` 已完成（`status=COMPLETED`），`steps[i]` 有 output
-- `i == step_index`：`plan[i]` 正在执行（`status=RUNNING`），`steps[i]` 正在跑
-- `i > step_index`：`plan[i]` 待执行（`status=PENDING`），`steps[i]` 尚未实例化
+在项目根目录准备 `.env`，至少包含 LLM 配置：
 
-## 为什么要同时存 `plan` 和 `steps`
+```bash
+OPENAI_API_KEY=<your-api-key>
+OPENAI_BASE_URL=<llm-base-url>      # 如豆包 ark endpoint
+MODEL_NAME=<model-name>
+```
 
-| 只存 `plan` 不行 | 只存 `steps` 不行 |
+### 3. 运行
+
+必须以模块方式运行（包内为相对导入）：
+
+```bash
+.venv/bin/python -m src.main demo
+```
+
+## CLI 命令
+
+统一入口：`python -m src.main <command> [arg] [--text ...] [--session ...]`
+
+| 命令 | 作用 |
 |---|---|
-| 暂停/恢复后不知道下一步该跑哪个子技能、用什么参数 | 无法知道总共有几步、步骤是否已全部规划完成 |
+| `demo`（默认） | 一键演示：写入默认消息 → 路由 → 执行 → 打印回复 |
+| `seed "<文本>"` | 只写入一条 user 消息并打印 chat_id（不执行） |
+| `run <chat_id>` | 对已有消息执行完整链路 |
+| `pause <task_id>` | 请求暂停任务（下一个步骤边界挂起） |
+| `resume <task_id>` | 从 checkpoint 恢复任务继续执行 |
+| `state <task_id>` | 查看任务的 checkpoint 记忆快照与递归执行树 |
+| `tasks` | 列出任务（可加 `--session <id>` 过滤） |
+| `list` | 列出最近的聊天消息 |
 
-`plan` 是**持久化的执行计划**，`steps` 是**运行时的执行产物**。两者配合才能支持：
-1. **暂停/恢复**：恢复时读 `step_index`，从 `plan[step_index]` 继续，已完成步骤的 output 留在 `steps` 里供 `input_from="prev_output"` 回溯
-2. **可观测性**：`collect_dynamic_skills` 收集所有 dynamic 节点，既能看规划（`plan`）又能看执行进度（`step_index`）和产物（`steps`）
-3. **嵌套递归**：`steps[i]` 本身可以是 dynamic 节点，拥有自己的 `plan`/`step_index`/`steps`，形成任意深度的递归执行树
+全局选项：`--text "..."`（自定义 demo/seed 文本，默认为上海天气 ReAct 简报）、`--session <id>`（会话 id，默认 `default`）。
 
-对应代码入口：[plan_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L441) 写 `plan`，[start_step_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L473) 读 `plan[step_index]` 并 append 到 `steps`，[complete_node](file:///Users/bill/PycharmProjects/langgraph-test/src/skill_runtime/graph.py#L573-L577) 推进 `step_index`。
+示例：
 
+```bash
+# 自定义文本的完整演示
+python -m src.main demo --text "把 hello 翻译成中文" --session demo1
 
+# 分步：先 seed 取 chat_id，再 run
+CID=$(python -m src.main seed "计算 (2+3)*4" | grep -o 'chat-[a-f0-9]*')
+python -m src.main run "$CID"
+
+# 纯关键词路由（跳过 LLM 意图裁决，便于离线调试）
+SKILL_FORCE_KEYWORD=1 python -m src.main demo --text "计算 1+1"
+
+# 暂停 / 恢复 / 查看状态（支持跨进程）
+python -m src.main pause  task-xxxxxxxx
+python -m src.main resume task-xxxxxxxx
+python -m src.main state  task-xxxxxxxx
+```
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `POSTGRES_DSN` | `postgresql://postgres:123456@localhost:5432/graph-test` | PostgreSQL 连接串 |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `MODEL_NAME` | — | LLM 配置 |
+| `TEMPERATURE` | `0.7` | LLM 温度 |
+| `SKILLS_DIR` | `<项目根>/skills` | 技能目录根路径 |
+| `SKILL_SCAN_INTERVAL` | `10` | 一级技能后台扫描间隔（秒） |
+| `DB_POOL_MIN_SIZE` / `DB_POOL_MAX_SIZE` | `1` / `10` | 连接池大小 |
+| `SKILL_FORCE_KEYWORD` | 未设置 | 设为 `1` 时全程走关键词兜底，不调用 LLM |
+| `LANGSMITH_TRACING` 等 | — | LangSmith 标准追踪环境变量，设置后自动上报 |
+
+## 测试
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+
+集成测试直连本地 PostgreSQL（库/表会自动初始化）；`asyncio_mode=auto`。
+
+## 可观测性
+
+所有图调用统一通过 `run_config(rt, thread_id, run_name=..., tags=..., metadata=...)` 构造配置：
+
+- RouterGraph：`run_name=router_{chat_id}`，tag `router`
+- TaskGraph 启动：`run_name=task_{task_id}_{标题}`，tags `task / skill:{入口技能} / session:{会话}`
+- TaskGraph 恢复：`run_name=resume_{task_id}`，metadata `phase=resume`
+- 结果综合 LLM：`run_name=synthesize_final_answer`，tag `aggregate`
+
+配置 `LANGSMITH_TRACING=true` 与 API key 后即可在 LangSmith 按上述名称/标签筛选每次运行。
+
+## 路线图
+
+- **P1（已完成）**：双图解耦、单消息→单任务、任务级暂停恢复、多任务并发与聚合框架。
+- **P2**：一条消息多意图拆分（1→N 任务）；`collecting` 状态支持跨消息任务归并。
+- **P3**：chat 级广播暂停/恢复；跨任务的聚合记忆视图。
