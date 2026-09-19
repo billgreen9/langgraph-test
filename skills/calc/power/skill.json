@@ -1,0 +1,9 @@
+{
+  "name": "幂运算",
+  "description": "计算 base 的 exponent 次幂，本地函数模块演示（module=functions）",
+  "type": "atomic",
+  "module": "functions",
+  "function": "power",
+  "keywords": ["次方", "次幂", "幂"],
+  "order": 0
+}
