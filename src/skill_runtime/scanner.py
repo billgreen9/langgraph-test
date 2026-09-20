@@ -49,6 +49,12 @@ class SkillScanner(threading.Thread):
             if ids:
                 self.db.skills.prune_level1(set(ids))
             logger.info("一级技能扫描完成：%s", ids or "<空>")
+            try:
+                from .intent_sync import sync_intent_seeds
+
+                sync_intent_seeds(self.loader)
+            except Exception:
+                logger.exception("intent_math 种子同步失败")
             return ids
 
     def run(self) -> None:

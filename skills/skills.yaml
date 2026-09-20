@@ -1,0 +1,45 @@
+# 高精度匹配配置。intent_config 中已有的 key 不会被覆盖。
+# 精排分 > score_limit 才过线；> llm_skip 则本层不调 LLM 直接命中。
+
+rank_top_k: 5
+keyword_top_k: 20
+semantic_top_k: 20
+rerank_top_n: 8
+rrf_k: 60
+
+score_limit_by_level:
+  1: 0.45
+  2: 0.40
+  3: 0.35
+  4: 0.30
+
+llm_skip_by_level:
+  1: 0.78
+  2: 0.74
+  3: 0.70
+  4: 0.66
+
+atomic_score_limit: 0.82
+
+forbid_score_limit: 0.55
+forbid_llm_skip: 0.82
+
+unknown_answer: 对不起，我没有听懂，请详细说明
+
+forbid:
+  - seed: 股票
+    answer: 我只能处理天气、翻译和计算相关问题，无法提供炒股或理财建议。
+  - seed: 基金
+    answer: 我只能处理天气、翻译和计算相关问题，无法提供投资理财建议。
+  - seed: 炒股
+    answer: 我只能处理天气、翻译和计算相关问题，无法提供炒股或理财建议。
+  - seed: 看病
+    answer: 我不能提供医疗诊断或用药建议，请咨询专业医生。
+  - seed: 开药
+    answer: 我不能提供医疗诊断或用药建议，请咨询专业医生。
+  - seed: 买彩票
+    answer: 这个问题与天气、翻译、计算无关，我无法协助。
+  - seed: 点外卖
+    answer: 这个问题与天气、翻译、计算无关，我无法协助。
+  - seed: 政治选举
+    answer: 这个问题超出了我的业务范围，我无法回答。

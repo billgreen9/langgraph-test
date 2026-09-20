@@ -98,6 +98,20 @@ class SkillLoader:
         parent_dir = Path(parent.fs_path)
         return [self._load_dir(child) for child in self._child_dirs(parent_dir)]
 
+    def iter_all(self) -> list[SkillManifest]:
+        """遍历整棵技能树（同步 intent_math）。"""
+        result: list[SkillManifest] = []
+
+        def walk(parent: SkillManifest | None) -> None:
+            children = self.scan_level1() if parent is None else self.load_children(parent)
+            for child in children:
+                result.append(child)
+                if child.has_children:
+                    walk(child)
+
+        walk(None)
+        return result
+
     def get(self, skill_id: str) -> SkillManifest | None:
         """按 id 获取技能；缓存未命中时按路径直接加载对应层。"""
         with self._lock:

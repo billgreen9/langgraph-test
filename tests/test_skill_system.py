@@ -130,7 +130,7 @@ def test_keyword_match_and_fallback_plan():
     children = loader.load_children(weather)
 
     # 关键词直接命中动态技能（trip_react 的关键词不含“出行/规划”，不会抢匹配）
-    chosen = graph_mod.match_skill(children, "帮我做出行天气规划")
+    chosen = graph_mod._fallback_choice(children, "帮我做出行天气规划")
     assert chosen.skill_id == "weather.trip_plan"
 
     # 兜底规划：核心步骤按 order 在前，总结类（嵌套动态 briefing）置后

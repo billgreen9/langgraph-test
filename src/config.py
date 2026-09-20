@@ -25,6 +25,12 @@ class Settings:
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openai_base_url: str = field(default_factory=lambda: os.getenv("OPENAI_BASE_URL", ""))
     model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gpt-4o-mini"))
+    embedding_model: str = field(
+        default_factory=lambda: os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    )
+    rerank_model: str = field(
+        default_factory=lambda: os.getenv("RERANK_MODEL", "")
+    )
     temperature: float = field(default_factory=lambda: float(os.getenv("TEMPERATURE", "0.7")))
 
     # PostgreSQL 连接串

@@ -42,6 +42,22 @@ class ChatTask(BaseModel):
     updated_at: datetime | None = None
 
 
+class IntentMathRow(BaseModel):
+    """intent_math：一条可被召回的用户说法。"""
+
+    id: int | None = None
+    msg: str
+    score_limit: float = 0.45
+    skill_id: str | None = None
+    skill_level: int = 0
+    answer: str = ""
+    forbid: int = 0
+    source: str = "seed"
+    seed: str = ""
+    enabled: bool = True
+    msg_embedding: list[float] | None = None
+
+
 class SkillRow(BaseModel):
     """skill_registry：一行技能元数据（后台扫描线程维护）。"""
 

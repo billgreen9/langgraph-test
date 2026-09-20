@@ -46,6 +46,14 @@ from psycopg_pool import AsyncConnectionPool
 from ..config import settings
 from .functions import resolve_function
 from .loader import SkillLoader
+from .match_config import UNKNOWN_ANSWER
+from .matching import (
+    KIND_AUTO,
+    KIND_LLM,
+    llm_confirm_skill,
+    match_scope,
+)
+from .rerank import get_rerank_llm
 from .schema import SkillManifest
 from .tooling import (
     REACT_FINISH_TOOL,
@@ -249,41 +257,37 @@ def _fallback_choice(manifests: list[SkillManifest], text: str) -> SkillManifest
 
 
 def match_skill(manifests: list[SkillManifest], text: str,
-                rt: Runtime | None = None) -> SkillManifest:
-    """关键词打分；完全无命中时让 LLM 以 tool_calls 协议裁决，失败则兜底。"""
+                rt: Runtime | None = None) -> SkillManifest | None:
+    """本层 intent_math：高分直接命中，灰区 LLM 可拒绝，未过线返回 None。"""
     if not manifests:
         raise ValueError("没有可匹配的子技能")
-    if len(manifests) == 1:
-        return manifests[0]
-
-    if rt is not None and rt.force_keyword:
-        return _fallback_choice(manifests, text)
-
-    if any(_keyword_score(m, text) > 0 for m in manifests):
-        return _fallback_choice(manifests, text)
-
-    if rt is not None:
-        listing = "\n".join(
-            f"- {m.skill_id}：{m.name}。{m.description}" for m in manifests
+    level = manifests[0].level
+    ids = {m.skill_id for m in manifests}
+    by_id = {m.skill_id: m for m in manifests}
+    force_lexical = rt is None or rt.force_keyword
+    llm = None if force_lexical else get_rerank_llm()
+    try:
+        band = match_scope(
+            text,
+            skill_level=level,
+            skill_ids=ids,
+            forbid=False,
+            use_vector=not force_lexical,
+            llm=llm,
+            force_lexical=force_lexical,
         )
-        prompt = (
-            "你是技能路由器。根据用户请求，通过调用候选技能对应的工具选择最合适的一个"
-            "（工具名即技能）。不要执行任务，只做选择。\n候选技能：\n"
-            f"{listing}\n用户请求：{text}"
-        )
-        try:
-            resp = rt.llm.bind_tools(
-                [manifest_tool(m, "choose") for m in manifests]
-            ).invoke([SystemMessage(content=prompt), HumanMessage(content=text)])
-            rev = {tool_name_for(m.skill_id): m for m in manifests}
-            for name, _args in parse_tool_calls(resp):
-                selected = rev.get(name)
-                if selected is not None:
-                    logger.info("LLM tool_calls 路由选择 %s", selected.skill_id)
-                    return selected
-        except Exception:
-            logger.exception("LLM 路由失败，使用关键词/默认兜底")
-    return _fallback_choice(manifests, text)
+    except Exception:
+        logger.exception("intent_math 下探失败")
+        return None
+    if band.kind == KIND_AUTO and band.skill_id in by_id:
+        logger.info("下探直接命中 %s score=%.3f", band.skill_id, band.score)
+        return by_id[band.skill_id]
+    if band.kind == KIND_LLM:
+        cands = [by_id[s] for s in band.skill_ids if s in by_id]
+        if force_lexical or rt is None:
+            return None
+        return llm_confirm_skill(get_rerank_llm() or rt.llm, text, cands)
+    return None
 
 
 SUMMARY_KEYWORDS = {"简报", "总结", "建议", "翻译", "译文", "brief"}
@@ -490,8 +494,19 @@ async def descend_node(state: AgentState, config: RunnableConfig) -> dict[str, A
     except Exception:
         logger.exception("缓存子技能到 DB 失败（不影响执行）")
 
-    match_text = f"{state['user_input']}\n{parent.objective}".strip()
+    match_text = state["user_input"]
     chosen = match_skill(children, match_text, rt)
+    if chosen is None:
+        logger.info("[descend] %s 下探未命中", parent.skill_id)
+
+        def mark_unknown(n: SkillExecutionNode) -> None:
+            n.output = UNKNOWN_ANSWER
+            n.status = S.COMPLETED
+            n.finished_at = utcnow()
+
+        new_tree, node = update_node(tree, state["cursor"], mark_unknown)
+        return {"tree": new_tree, "cursor": state["cursor"], **_common(node, S.COMPLETED)}
+
     logger.info("[descend] %s 下探 -> %s（%s）",
                 parent.skill_id, chosen.skill_id, chosen.type)
 
@@ -1046,9 +1061,8 @@ async def finish_node(state: AgentState, config: RunnableConfig) -> dict[str, An
     tree = state["tree"]
     failed = state.get("status") == S.FAILED
     outputs = collect_leaf_outputs(tree)
-    # ReAct 节点的结论是 LLM 综合后的 final_answer；其余范式沿用叶子输出拼接
     answer = state.get("final_answer") or (
-        "\n".join(outputs) if outputs else "（技能执行未产生输出）"
+        "\n".join(outputs) if outputs else (tree.output or "（技能执行未产生输出）")
     )
     final_status = S.FAILED if failed else S.COMPLETED
     failed_errors = [n.error for n in iter_nodes(tree)
@@ -1069,6 +1083,13 @@ async def finish_node(state: AgentState, config: RunnableConfig) -> dict[str, An
 # ---------- 条件边 ----------
 def _classify(state: AgentState) -> str:
     node = get_node(state["tree"], state["cursor"])
+    return NEXT_BY_TYPE[node.node_type]
+
+
+def _after_descend(state: AgentState) -> str:
+    node = get_node(state["tree"], state["cursor"])
+    if node.status == S.COMPLETED:
+        return "complete"
     return NEXT_BY_TYPE[node.node_type]
 
 
@@ -1144,9 +1165,9 @@ def build_graph(rt: Runtime):
          "react_think": "react_think"},
     )
     g.add_conditional_edges(
-        "descend", _classify,
+        "descend", _after_descend,
         {"execute": "execute", "descend": "descend", "plan": "plan",
-         "react_think": "react_think"},
+         "react_think": "react_think", "complete": "complete"},
     )
     g.add_edge("plan", "start_step")
     g.add_conditional_edges(

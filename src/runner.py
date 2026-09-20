@@ -73,7 +73,7 @@ async def process_message(
     async with Runtime(loader=loader) as rt:
         # 1. 路由：一条消息 -> pending 任务（P1 恰好 1 个）
         router = build_router_graph(rt)
-        await router.ainvoke(
+        routed = await router.ainvoke(
             {"chat_id": chat_id},
             run_config(
                 rt,
@@ -83,6 +83,21 @@ async def process_message(
                 metadata={"chat_id": chat_id},
             ),
         )
+
+        if routed.get("mode") == "reply":
+            from .skill_runtime.match_config import UNKNOWN_ANSWER
+
+            message = await asyncio.to_thread(db.messages.get, chat_id)
+            assistant = ChatRecord(
+                chat_id=f"chat-{uuid.uuid4().hex[:8]}",
+                session_id=message.session_id if message else "default",
+                user_id=message.user_id if message else None,
+                role="assistant",
+                content=routed.get("reply_text") or UNKNOWN_ANSWER,
+            )
+            await asyncio.to_thread(db.messages.insert, assistant)
+            logger.info("消息 %s 直接回复 assistant=%s", chat_id, assistant.chat_id)
+            return assistant
 
         # 2. 执行：与该消息关联的 pending 任务，各自独立 TaskGraph
         tasks = await asyncio.to_thread(

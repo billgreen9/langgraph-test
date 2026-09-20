@@ -16,6 +16,7 @@
     python -m src.main state <task_id>                # 查看某任务的 LangGraph 记忆
     python -m src.main tasks [--session s1]           # 列出任务
     python -m src.main list                           # 列出消息
+    python -m src.main gen-queries                    # 按技能描述造句写入 intent_math
 """
 
 from __future__ import annotations
@@ -141,7 +142,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="意图路由 + 任务化技能执行")
     parser.add_argument(
         "command", nargs="?", default="demo",
-        choices=["demo", "seed", "run", "pause", "resume", "state", "tasks", "list"],
+        choices=["demo", "seed", "run", "pause", "resume", "state", "tasks", "list", "gen-queries"],
     )
     parser.add_argument("arg", nargs="?", help="chat_id / task_id / 聊天文本")
     parser.add_argument("--text", default=DEMO_TEXT, help="demo/seed 使用的文本")
@@ -171,6 +172,12 @@ def main() -> None:
         cmd_tasks(args.session if args.session != DEFAULT_SESSION else None)
     elif args.command == "list":
         cmd_list()
+    elif args.command == "gen-queries":
+        from .skill_runtime.intent_sync import sync_all
+
+        loader = SkillLoader()
+        stats = sync_all(loader, generate=True)
+        print("intent_math 造句完成：", stats)
     db.close()
 
 
