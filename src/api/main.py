@@ -3,8 +3,8 @@
 PyCharm 调试：直接 Debug 本文件（不要点 ``app = FastAPI()`` 旁边的运行按钮）。
 命令行::
 
-    python -m src.api.main
-    uvicorn src.api.main:app --reload --port 8000
+    python -m api.main
+    uvicorn api.main:app --reload --port 8000
 
 接口：
 - ``GET  /``        服务信息

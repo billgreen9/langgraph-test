@@ -30,8 +30,15 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[project.scripts]
+long-task = "long_task.main:main"
+
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src", "src/long_task", "src/api"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/long_task" = "long_task"
+"src/api" = "api"
 
 [tool.ruff]
 line-length = 100

@@ -1,9 +1,9 @@
 """单独跑长任务图。图节点会请求 API 的 ``GET /slow``。
 
-先启动接口，再跑本程序::
+PyCharm 直接 Debug 本文件即可。命令行::
 
-    uvicorn src.api.main:app --port 8000
-    python -m src.long_task.main
+    uvicorn api.main:app --port 8000
+    python -m long_task.main
 """
 
 from __future__ import annotations
